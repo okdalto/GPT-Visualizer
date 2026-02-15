@@ -335,6 +335,7 @@ class Scene:
             box_size=bs, gap=gap,
         )
         v.phase_group = 0
+        v.fade_inputs_on_takeover = True  # LN1/W1 fade gradually when ReLU starts
         stage.visuals.append(v)
 
         # ReLU: applies in-place at Matmul 1's C position
