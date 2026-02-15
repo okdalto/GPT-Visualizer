@@ -151,4 +151,4 @@ STAGE_SPEED = {
 
 ## License
 
-MIT
+GPL-3.0
