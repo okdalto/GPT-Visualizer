@@ -47,7 +47,7 @@ class StageTimeline:
 #          Higher = faster (2.0 → half duration), 0.5 → double.
 #          Omit or use empty list for stages with no compute.
 STAGE_SPEED = {
-    'input':              {'appear': 1.0, 'settle': 1.0},
+    'input':              {'appear': 1.0, 'settle': 2.0},
     'qkv_projection':     {'appear': 1.0, 'settle': 1.0, 'compute': [
                                0.6,           # QKV matmul (parallel)
                            ]},

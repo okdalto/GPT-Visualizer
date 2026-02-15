@@ -244,6 +244,7 @@ class Scene:
             v.color_vmax_a = q_vmax  # Q_h uses full Q's range
             v.color_vmax_b = k_vmax  # K_h^T uses full K's range
             v.phase_group = 0
+            v.fade_inputs_on_takeover = True  # Q_h/K_h^T fade gradually when softmax starts
             stage.visuals.append(v)
 
             # Sub-op 2: softmax(Scores) = Weights (phase_group 1)
@@ -888,17 +889,25 @@ class Scene:
                         for v in stage.visuals:
                             g = getattr(v, 'phase_group', 0)
                             if g < max_started:
-                                v.alpha = 0.0
                                 v.output_alpha_mult = 0.0
-                                # Smooth label crossfade based on next group's
-                                # appear progress (first 20% of its segment)
-                                if phase == 'compute':
+                                if isinstance(v, ActivationVisual):
+                                    # Keep alpha > 0 so label persists;
+                                    # visual boxes hidden via output_alpha_mult=0
+                                    v._label_output_fade = 1.0
+                                elif phase == 'compute':
                                     next_start, next_end = stage._get_group_segment(g + 1)
                                     next_seg_len = next_end - next_start
                                     next_local = (t - next_start) / max(next_seg_len, 1e-6)
+                                    if v.fade_inputs_on_takeover:
+                                        # Q_h/K_h^T: fade A/B over first 20%
+                                        # C stays hidden (output_alpha_mult=0)
+                                        v.alpha = max(0.0, 1.0 - min(next_local / 0.20, 1.0))
+                                    else:
+                                        v.alpha = 0.0
                                     v._label_output_fade = max(
                                         0.0, 1.0 - min(next_local / 0.20, 1.0))
                                 else:
+                                    v.alpha = 0.0
                                     v._label_output_fade = 0.0
 
             # Fade done stages: previous stage fades during next stage's appear

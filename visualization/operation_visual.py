@@ -166,6 +166,8 @@ class BaseVisual:
         self.phase_group = 0
         self.is_stage_output = False
         self.output_alpha_mult = 1.0
+        self.fade_inputs_on_takeover = False
+        self._label_output_fade = 1.0
 
 
 class MatmulVisual(BaseVisual):
