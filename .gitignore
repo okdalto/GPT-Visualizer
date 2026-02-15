@@ -2,3 +2,7 @@ __pycache__/
 *.pyc
 .vscode/
 .claude/
+data/
+recordings/
+.DS_Store
+*.wav

@@ -49,7 +49,7 @@ class StageTimeline:
 STAGE_SPEED = {
     'input':              {'appear': 1.0, 'settle': 1.0},
     'qkv_projection':     {'appear': 1.0, 'settle': 1.0, 'compute': [
-                               1.0,           # QKV matmul (parallel)
+                               0.6,           # QKV matmul (parallel)
                            ]},
     'multi_head_attn':    {'appear': 1.0, 'settle': 1.0, 'compute': [
                                1.0,           # Q × K^T

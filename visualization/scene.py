@@ -147,6 +147,10 @@ class Scene:
         self._build_camera_path()
         self._build_labels()
 
+        # Smooth label fade state
+        self._label_fade = {}   # (stage_name, idx) -> current alpha
+        self._prev_label_time = 0.0
+
     def _build_all_stages(self):
         r = self.results
         c = self.config
@@ -302,30 +306,10 @@ class Scene:
         # Sequential: Add (group 0) → LN (group 1)
         # All matrices centered, spaced only along Z
         # =========================================================
-        stage = Stage('residual_ln1')
-        z = STAGE_Z['residual_ln1']
-
         w16 = c.d_model * SPACING
-        xs_add = side_by_side_x([w16, w16], gap=MATRIX_X_GAP)
-
-        v = AddVisual(
-            A=r['input'], B=r['attn_output'], C=r['residual1'],
-            origin_a=matrix_origin(z, xs_add[1], 2),
-            origin_b=matrix_origin(z, xs_add[0], 2),
-            origin_c=matrix_origin(z + RESIDUAL_ADD_Z, -w16 / 2, 2),
-            box_size=bs, gap=gap,
-        )
-        v.phase_group = 0
-        stage.visuals.append(v)
-
-        v = ActivationVisual(
-            pre=r['residual1'], post=r['layernorm1'],
-            origin=matrix_origin(z + RESIDUAL_ADD_Z, -w16 / 2, 2),
-            box_size=bs, gap=gap,
-        )
-        v.phase_group = 1
-        stage.visuals.append(v)
-        self.stages['residual_ln1'] = stage
+        self._build_residual_ln_stage(
+            'residual_ln1', r['input'], r['attn_output'],
+            r['residual1'], r['layernorm1'], w16, bs, gap)
 
         # =========================================================
         # Stage 6: FFN
@@ -377,29 +361,9 @@ class Scene:
         # Sequential: Add (group 0) → LN (group 1)
         # All matrices centered, spaced only along Z
         # =========================================================
-        stage = Stage('residual_ln2')
-        z = STAGE_Z['residual_ln2']
-
-        xs_add2 = side_by_side_x([w16, w16], gap=MATRIX_X_GAP)
-
-        v = AddVisual(
-            A=r['layernorm1'], B=r['ffn_output'], C=r['residual2'],
-            origin_a=matrix_origin(z, xs_add2[1], 2),
-            origin_b=matrix_origin(z, xs_add2[0], 2),
-            origin_c=matrix_origin(z + RESIDUAL_ADD_Z, -w16 / 2, 2),
-            box_size=bs, gap=gap,
-        )
-        v.phase_group = 0
-        stage.visuals.append(v)
-
-        v = ActivationVisual(
-            pre=r['residual2'], post=r['layernorm2'],
-            origin=matrix_origin(z + RESIDUAL_ADD_Z, -w16 / 2, 2),
-            box_size=bs, gap=gap,
-        )
-        v.phase_group = 1
-        stage.visuals.append(v)
-        self.stages['residual_ln2'] = stage
+        self._build_residual_ln_stage(
+            'residual_ln2', r['layernorm1'], r['ffn_output'],
+            r['residual2'], r['layernorm2'], w16, bs, gap)
 
         # =========================================================
         # Stage 8: Output
@@ -411,6 +375,31 @@ class Scene:
         v.phase_group = 0
         stage.visuals.append(v)
         self.stages['output'] = stage
+
+    def _build_residual_ln_stage(self, name, add_a, add_b, add_c, ln_post, w, bs, gap):
+        """Build a Residual + LayerNorm stage (Add group 0 → LN group 1)."""
+        stage = Stage(name)
+        z = STAGE_Z[name]
+        xs = side_by_side_x([w, w], gap=MATRIX_X_GAP)
+
+        v = AddVisual(
+            A=add_a, B=add_b, C=add_c,
+            origin_a=matrix_origin(z, xs[1], 2),
+            origin_b=matrix_origin(z, xs[0], 2),
+            origin_c=matrix_origin(z + RESIDUAL_ADD_Z, -w / 2, 2),
+            box_size=bs, gap=gap,
+        )
+        v.phase_group = 0
+        stage.visuals.append(v)
+
+        v = ActivationVisual(
+            pre=add_c, post=ln_post,
+            origin=matrix_origin(z + RESIDUAL_ADD_Z, -w / 2, 2),
+            box_size=bs, gap=gap,
+        )
+        v.phase_group = 1
+        stage.visuals.append(v)
+        self.stages[name] = stage
 
     def _wire_flow_connections(self):
         """Wire up from_origin on each visual so data flies from the previous stage/sub-op."""
@@ -755,66 +744,69 @@ class Scene:
         lbl('output', 'Output', v.origin, r, cl, v.sp, v)
 
     def render_labels(self, text_renderer, fb_w, fb_h):
-        """Project 3D label positions to 2D screen and render text.
+        """Render labels in world space using the camera's view/projection.
 
-        Each label fades in/out with its visual's animation:
-          'appear'  labels track visual.appear_t  (inputs flying in)
-          'compute' labels track visual.t          (results emerging)
-        Both multiplied by visual.alpha (handles stage fade-out).
+        Labels are placed on the XY plane at their 3D positions and
+        transformed by the camera like all other geometry, so they
+        rotate with the scene and are naturally depth-tested.
         """
         view = self.camera.get_view_matrix()
         aspect = fb_w / max(fb_h, 1)
         proj = self.camera.get_projection_matrix(aspect)
-        vp = proj @ view
 
-        for stage in self.stages.values():
+        for stage_name, stage in self.stages.items():
             if stage.alpha < 0.01:
                 continue
-            for text, world_pos, visual, phase in stage.labels:
-                # Per-label alpha from visual animation state
-                if phase == 'appear':
-                    fade = visual.appear_t
-                else:
-                    # 'compute': smooth gate instead of binary threshold
-                    appear_gate = max(0.0, min((visual.appear_t - 0.85) / 0.15, 1.0))
-                    fade = visual.t * appear_gate
-                    # Smooth fade for in-place takeover (softmax/LN replacing predecessor)
-                    fade *= getattr(visual, '_label_output_fade', 1.0)
-                label_alpha = visual.alpha * fade
+            for idx, (text, world_pos, visual, phase) in enumerate(stage.labels):
+                label_alpha = self._label_fade.get((stage_name, idx), 0.0)
                 if label_alpha < 0.01:
                     continue
 
-                p = np.array([world_pos[0], world_pos[1], world_pos[2], 1.0],
-                             dtype=np.float32)
-                clip = vp @ p
-                if abs(clip[3]) < 1e-6:
-                    continue
-                ndc_x = clip[0] / clip[3]
-                ndc_y = clip[1] / clip[3]
-                ndc_z = clip[2] / clip[3]
-
-                if abs(ndc_x) > 1.5 or abs(ndc_y) > 1.5:
-                    continue
-
-                screen_x = (ndc_x + 1.0) * 0.5 * fb_w
-                screen_y = (ndc_y + 1.0) * 0.5 * fb_h
-
-                text_width = text_renderer._measure_text(text)
-                screen_x -= text_width / 2
-
-                # Depth for occlusion: NDC [-1,1] -> depth buffer [0,1]
-                depth = max(0.0, min(1.0, (ndc_z + 1.0) * 0.5 - 0.001))
-
-                text_renderer.render_text(
-                    text, screen_x, screen_y, fb_w, fb_h,
-                    color=(1.0, 1.0, 1.0, label_alpha * 0.9),
-                    depth=depth)
+                text_renderer.render_text_3d(
+                    text, world_pos, view, proj,
+                    char_height=0.75,
+                    color=(1.0, 1.0, 1.0, label_alpha * 0.9))
 
     def update(self, dt: float):
         self.timeline.update(dt)
         self.camera.set_time(self.timeline.current_time)
         self.camera.update(dt)
         self._update_animations()
+        self._update_label_fades()
+
+    def _update_label_fades(self):
+        """Smoothly interpolate label alpha independently from animation state."""
+        dt = self.timeline.current_time - self._prev_label_time
+        if dt < 0 or dt > 1.0:
+            dt = 1.0 / 30.0
+        self._prev_label_time = self.timeline.current_time
+
+        FADE_IN = 0.45
+        FADE_OUT = 0.35
+
+        for stage_name, stage in self.stages.items():
+            for idx, (text, world_pos, visual, phase) in enumerate(stage.labels):
+                key = (stage_name, idx)
+
+                # Target: should this label be visible?
+                if visual.alpha < 0.01:
+                    target = 0.0
+                elif phase == 'appear':
+                    target = 1.0 if visual.appear_t > 0.05 else 0.0
+                else:
+                    visible = visual.appear_t > 0.8 and visual.t > 0.02
+                    target = 1.0 if visible else 0.0
+                    target *= getattr(visual, '_label_output_fade', 1.0)
+
+                target *= min(visual.alpha, 1.0)
+
+                # Linear interpolation toward target
+                current = self._label_fade.get(key, 0.0)
+                if target > current:
+                    current = min(target, current + dt / FADE_IN)
+                else:
+                    current = max(target, current - dt / FADE_OUT)
+                self._label_fade[key] = current
 
     def _update_animations(self):
         """Update visual properties based on timeline state.
@@ -908,7 +900,7 @@ class Scene:
         self.shader.set_vec3("u_light_dir", np.array([0.3, -0.8, -0.5], dtype=np.float32))
         self.shader.set_vec3("u_camera_pos", self.camera.position)
 
-        for _, stage in self.stages.items():
+        for stage in self.stages.values():
             if stage.alpha < 0.01:
                 continue
 

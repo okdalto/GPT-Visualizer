@@ -14,12 +14,8 @@ MHA_HEAD_Y_GAP = 4.0      # vertical gap between attention heads
 MATMUL_Z_C = 2.0          # result matrix Z offset from A
 MATMUL_Z_B = 4.0          # weight matrix Z offset from A
 
-# Z-axis offsets between MHA sub-operations (relative to MHA stage Z)
-MHA_SOFTMAX_Z = 15.0      # softmax sub-op Z offset
-
 # Z-axis offsets within residual+layernorm stages
 RESIDUAL_ADD_Z = 6.0      # Add result Z offset
-RESIDUAL_LN_Z = 12.0       # LayerNorm Z offset
 
 # Z-axis offsets within FFN stage
 FFN_W1_Z = 4.0            # W1 weight Z offset

@@ -11,9 +11,21 @@ MatmulVisual follows the descent+dissolve+collapse pattern:
   2. B splits into per-element copies that dissolve INTO A (weights consumed)
   3. Products emerge from A rows and collapse to C positions (summation)
 """
+import os
 import numpy as np
 from visualization.colormap import matrix_to_colors
 from animation.easing import ease_in_out_cubic, ease_out_cubic, smoothstep
+
+
+# ── Shared constants and helpers ──────────────────────────────────
+_EMPTY_INSTANCES = np.zeros((0, 10), dtype=np.float32)
+_EMPTY_INSTANCES.flags.writeable = False
+
+
+def _to_instance_array(instances):
+    if not instances:
+        return _EMPTY_INSTANCES
+    return np.array(instances, dtype=np.float32)
 
 
 def _box_pos(origin, row, col, spacing):
@@ -37,6 +49,102 @@ def _lerp_pos(a, b, t):
     return a + (b - a) * t
 
 
+def _set_alpha(color, alpha):
+    c = color.copy()
+    c[3] = alpha
+    return c
+
+
+# ── Pre-computed noise table for per-element Bezier variation ──────
+_NOISE_SIZE = 128
+_NOISE_PATH = os.path.join(os.path.dirname(__file__), '..', 'data', 'noise_table.npy')
+_NOISE_TABLE = None  # (128, 128, 4) float32 — channels: ny1, ny2, nx, nz
+
+
+def _generate_noise_table():
+    """Build noise table using multi-octave Perlin gradient noise."""
+    perm = [
+        151,160,137,91,90,15,131,13,201,95,96,53,194,233,7,225,140,36,103,30,
+        69,142,8,99,37,240,21,10,23,190,6,148,247,120,234,75,0,26,197,62,
+        94,252,219,203,117,35,11,32,57,177,33,88,237,149,56,87,174,20,125,
+        136,171,168,68,175,74,165,71,134,139,48,27,166,77,146,158,231,83,
+        111,229,122,60,211,133,230,220,105,92,41,55,46,245,40,244,102,143,
+        54,65,25,63,161,1,216,80,73,209,76,132,187,208,89,18,169,200,196,
+        135,130,116,188,159,86,164,100,109,198,173,186,3,64,52,217,226,250,
+        124,123,5,202,38,147,118,126,255,82,85,212,207,206,59,227,47,16,
+        58,17,182,189,28,42,223,183,170,213,119,248,152,2,44,154,163,70,
+        221,153,101,155,167,43,172,9,129,22,39,253,19,98,108,110,79,113,
+        224,232,178,185,112,104,218,246,97,228,251,34,242,193,238,210,144,
+        12,191,179,162,241,81,51,145,235,249,14,239,107,49,192,214,31,181,
+        199,106,157,184,84,204,176,115,121,50,45,127,4,150,254,138,236,205,
+        93,222,114,67,29,24,72,243,141,128,195,78,66,215,61,156,180,
+    ]
+    perm *= 2
+    grads = [(1, 1), (-1, 1), (1, -1), (-1, -1)]
+
+    def _perlin2d(x, y):
+        xi = int(np.floor(x)) & 255
+        yi = int(np.floor(y)) & 255
+        xf = x - np.floor(x)
+        yf = y - np.floor(y)
+        u = xf * xf * xf * (xf * (xf * 6 - 15) + 10)
+        v = yf * yf * yf * (yf * (yf * 6 - 15) + 10)
+        def _g(h, dx, dy):
+            gx, gy = grads[h & 3]
+            return gx * dx + gy * dy
+        aa = perm[perm[xi] + yi]; ba = perm[perm[xi + 1] + yi]
+        ab = perm[perm[xi] + yi + 1]; bb = perm[perm[xi + 1] + yi + 1]
+        x1 = _g(aa, xf, yf) * (1 - u) + _g(ba, xf - 1, yf) * u
+        x2 = _g(ab, xf, yf - 1) * (1 - u) + _g(bb, xf - 1, yf - 1) * u
+        return x1 * (1 - v) + x2 * v
+
+    def _flow(row, col, seed):
+        x = row * 0.5 + seed
+        y = col * 0.5 + seed * 0.7
+        return (_perlin2d(x, y) * 0.6 +
+                _perlin2d(x * 2, y * 2) * 0.3 +
+                _perlin2d(x * 4, y * 4) * 0.1)
+
+    N = _NOISE_SIZE
+    table = np.empty((N, N, 4), dtype=np.float32)
+    seeds = [0.0, 3.0, 17.0, 31.0]
+    for ch, seed in enumerate(seeds):
+        for r in range(N):
+            for c in range(N):
+                table[r, c, ch] = _flow(r, c, seed)
+    return table
+
+
+def _get_noise_table():
+    global _NOISE_TABLE
+    if _NOISE_TABLE is not None:
+        return _NOISE_TABLE
+    path = os.path.abspath(_NOISE_PATH)
+    if os.path.exists(path):
+        _NOISE_TABLE = np.load(path)
+    else:
+        _NOISE_TABLE = _generate_noise_table()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        np.save(path, _NOISE_TABLE)
+    return _NOISE_TABLE
+
+
+# ── Noise-warped linear interpolation ──────────────────────────────
+def _bezier_pos(src, dst, t, arc=0.3, row=0, col=0):
+    """Straight-line lerp with per-element noise speed variation.
+
+    Each element gets a slightly different progress curve based on Perlin noise.
+    Parabolic warp ensures all elements start and end together (t=0→0, t=1→1)
+    but diverge in the middle, creating organic staggering.
+    """
+    tbl = _get_noise_table()
+    n = tbl[row % _NOISE_SIZE, col % _NOISE_SIZE, 0]
+    # Parabolic warp: peaks at t=0.5, zero at endpoints
+    wt = t + n * 0.2 * (4.0 * t * (1.0 - t))
+    wt = max(0.0, min(1.0, wt))
+    return src + (dst - src) * wt
+
+
 def _wave_t(base_t, row, col, rows, cols, stagger=0.3):
     """Per-element staggered timing with diagonal wave (top-left → bottom-right).
     Returns eased t in [0, 1] for this element."""
@@ -46,7 +154,21 @@ def _wave_t(base_t, row, col, rows, cols, stagger=0.3):
     return ease_in_out_cubic(raw)
 
 
-class MatmulVisual:
+# ── Base class for shared animation state ─────────────────────────
+class BaseVisual:
+    """Common animation state for all visual types."""
+
+    def __init__(self):
+        self.appear_t = 0.0
+        self.t = 0.0
+        self.depart_t = 0.0
+        self.alpha = 1.0
+        self.phase_group = 0
+        self.is_stage_output = False
+        self.output_alpha_mult = 1.0
+
+
+class MatmulVisual(BaseVisual):
     """C = A × B with descent + dissolve + collapse animation.
 
     appear: A flies in from from_origin_a (or from_origin_a_slices for multi-source)
@@ -60,6 +182,7 @@ class MatmulVisual:
     def __init__(self, A, B, C, origin_a, origin_b, origin_c,
                  box_size=0.4, gap=0.1, box_size_b=None, gap_b=None,
                  box_size_c=None, gap_c=None):
+        super().__init__()
         self.A = A
         self.B = B
         self.C = C
@@ -81,15 +204,6 @@ class MatmulVisual:
         self.transpose_fly_b = False  # True = B elements fly from transposed positions (e.g. K_h → K_h^T)
         self.to_origin_c = None
 
-        # Animation state (set by Stage)
-        self.appear_t = 0.0
-        self.t = 0.0
-        self.depart_t = 0.0
-        self.alpha = 1.0
-        self.phase_group = 0
-        self.is_stage_output = False
-        self.output_alpha_mult = 1.0  # 0 = hide C instantly during fade
-
         # Optional: override color normalization range (for sliced matrices)
         self.color_vmax_a = None
         self.color_vmax_b = None
@@ -107,7 +221,7 @@ class MatmulVisual:
 
     def get_instance_data(self):
         if self.alpha < 0.01:
-            return np.zeros((0, 10), dtype=np.float32)
+            return _EMPTY_INSTANCES
 
         self._ensure_colors()
         m, k = self.A.shape
@@ -127,7 +241,7 @@ class MatmulVisual:
                             at = _wave_t(self.appear_t, i, local_p, m, slice_w)
                             src = _box_pos(slice_origin, i, local_p, self.sp)
                             dst = _box_pos(self.origin_a, i, p, self.sp)
-                            pos = _lerp_pos(src, dst, at)
+                            pos = _bezier_pos(src, dst, at, row=i, col=p)
                             color = self._colors_a[i, p].copy()
                             color[3] = self.alpha
                             instances.append(_make_instance(pos, color, self.bs))
@@ -140,7 +254,7 @@ class MatmulVisual:
                         at = _wave_t(self.appear_t, i, p, m, k)
                         src = _box_pos(from_o, i, p, self.sp)
                         dst = _box_pos(self.origin_a, i, p, self.sp)
-                        pos = _lerp_pos(src, dst, at)
+                        pos = _bezier_pos(src, dst, at, row=i, col=p)
                         color = self._colors_a[i, p].copy()
                         if seamless:
                             color[3] = self.alpha
@@ -168,7 +282,7 @@ class MatmulVisual:
                         else:
                             src = _box_pos(from_b, r, c, self.sp_b)
                         dst = _box_pos(self.origin_b, r, c, self.sp_b)
-                        pos = _lerp_pos(src, dst, bt)
+                        pos = _bezier_pos(src, dst, bt, row=r, col=c)
                         color = self._colors_b[r, c].copy()
                         if b_seamless:
                             # Smooth alpha transition: 1.0 → 0.9 as element arrives
@@ -178,7 +292,7 @@ class MatmulVisual:
                             color[3] = self.alpha * bt * 0.9
                             instances.append(_make_instance(pos, color, self.bs_b * (0.3 + 0.7 * bt)))
 
-            return np.array(instances, dtype=np.float32) if instances else np.zeros((0, 10), dtype=np.float32)
+            return _to_instance_array(instances)
 
         # === Phase: Compute (fly from B → dissolve at A → collapse to C) ===
         if self.t > 0.0 or self.appear_t >= 1.0:
@@ -249,7 +363,7 @@ class MatmulVisual:
                         b_src = _box_pos(self.origin_b, p, j, self.sp_b)
                         a_row0 = _box_pos(self.origin_a, 0, p, self.sp)
 
-                        pos = _lerp_pos(b_src, a_row0, fly_t)
+                        pos = _bezier_pos(b_src, a_row0, fly_t, row=p, col=j)
                         color = self._colors_b[p, j].copy()
                         color[3] = self.alpha * (0.5 + 0.5 * fly_t)
                         xy_s = self.bs_b + (self.bs * 0.75 - self.bs_b) * fly_t
@@ -334,7 +448,7 @@ class MatmulVisual:
                                 self.origin_a[2]
                             ], dtype=np.float32)
                             c_target = _box_pos(self.origin_c, i, j, self.sp_c)
-                            pos = _lerp_pos(row_center, c_target, collapse_t)
+                            pos = _bezier_pos(row_center, c_target, collapse_t, row=i, col=j)
                             color = self._colors_c[i, j].copy()
                             color[3] = self.alpha * self.output_alpha_mult * (0.3 + 0.7 * collapse_t)
                             scale = self.bs_c * (0.3 + 0.7 * collapse_t)
@@ -347,17 +461,15 @@ class MatmulVisual:
                 for j in range(n):
                     src = _box_pos(self.origin_c, i, j, self.sp_c)
                     dst = _box_pos(self.to_origin_c, i, j, self.sp_c)
-                    pos = _lerp_pos(src, dst, dt_val)
+                    pos = _bezier_pos(src, dst, dt_val, row=i, col=j)
                     color = self._colors_c[i, j].copy()
                     color[3] = self.alpha * self.output_alpha_mult
                     instances.append(_make_instance(pos, color, self.bs_c))
 
-        if not instances:
-            return np.zeros((0, 10), dtype=np.float32)
-        return np.array(instances, dtype=np.float32)
+        return _to_instance_array(instances)
 
 
-class AddVisual:
+class AddVisual(BaseVisual):
     """C = A + B with flow:
     appear: A flies in from from_origin_a, B flies in from from_origin_b
     compute: B overlays on A → merge → result appears at C
@@ -366,6 +478,7 @@ class AddVisual:
 
     def __init__(self, A, B, C, origin_a, origin_b, origin_c,
                  box_size=0.4, gap=0.1):
+        super().__init__()
         self.A = A
         self.B = B
         self.C = C
@@ -381,14 +494,6 @@ class AddVisual:
         self.seamless_a = True   # False for skip connections (fade in instead)
         self.seamless_b = True
 
-        self.appear_t = 0.0
-        self.t = 0.0
-        self.depart_t = 0.0
-        self.alpha = 1.0
-        self.phase_group = 0
-        self.is_stage_output = False
-        self.output_alpha_mult = 1.0
-
         self._colors_a = None
         self._colors_b = None
         self._colors_c = None
@@ -401,7 +506,7 @@ class AddVisual:
 
     def get_instance_data(self):
         if self.alpha < 0.01:
-            return np.zeros((0, 10), dtype=np.float32)
+            return _EMPTY_INSTANCES
 
         self._ensure_colors()
         rows, cols = self.A.shape
@@ -418,7 +523,7 @@ class AddVisual:
                     at = _wave_t(self.appear_t, r, c, rows, cols)
                     src_a = _box_pos(from_a, r, c, self.sp)
                     dst_a = _box_pos(self.origin_a, r, c, self.sp)
-                    pos_a = _lerp_pos(src_a, dst_a, at)
+                    pos_a = _bezier_pos(src_a, dst_a, at, row=r, col=c)
                     col_a = self._colors_a[r, c].copy()
                     if seamless_a:
                         col_a[3] = self.alpha
@@ -430,7 +535,7 @@ class AddVisual:
                     bt = _wave_t(max(0, (self.appear_t - 0.15) / 0.85), r, c, rows, cols)
                     src_b = _box_pos(from_b, r, c, self.sp)
                     dst_b = _box_pos(self.origin_b, r, c, self.sp)
-                    pos_b = _lerp_pos(src_b, dst_b, bt)
+                    pos_b = _bezier_pos(src_b, dst_b, bt, row=r, col=c)
                     col_b = self._colors_b[r, c].copy()
                     if seamless_b:
                         # Smooth alpha transition: 1.0 → 0.8 as element arrives
@@ -439,7 +544,7 @@ class AddVisual:
                     else:
                         col_b[3] = self.alpha * bt * 0.8
                         instances.append(_make_instance(pos_b, col_b, self.bs * (0.3 + 0.7 * bt)))
-            return np.array(instances, dtype=np.float32) if instances else np.zeros((0, 10), dtype=np.float32)
+            return _to_instance_array(instances)
 
         # === Compute: B descends onto A, merge, result to C ===
         if self.t > 0.0 or self.appear_t >= 1.0:
@@ -459,23 +564,23 @@ class AddVisual:
 
                     if ect < P1:
                         fly = ease_out_cubic(ect / P1)
-                        instances.append(_make_instance(a_pos, self._set_alpha(self._colors_a[r, c], self.alpha), self.bs))
+                        instances.append(_make_instance(a_pos, _set_alpha(self._colors_a[r, c], self.alpha), self.bs))
                         b_target = np.array([a_pos[0], a_pos[1] + 0.4, a_pos[2] + 0.3], dtype=np.float32)
                         b_current = _lerp_pos(b_pos_src, b_target, fly)
-                        instances.append(_make_instance(b_current, self._set_alpha(self._colors_b[r, c], self.alpha * 0.8), self.bs))
+                        instances.append(_make_instance(b_current, _set_alpha(self._colors_b[r, c], self.alpha * 0.8), self.bs))
                     elif ect < P2:
                         merge = (ect - P1) / (P2 - P1)
-                        instances.append(_make_instance(a_pos, self._set_alpha(self._colors_a[r, c], self.alpha * (1.0 - merge * 0.6)), self.bs * (1.0 - merge * 0.4)))
+                        instances.append(_make_instance(a_pos, _set_alpha(self._colors_a[r, c], self.alpha * (1.0 - merge * 0.6)), self.bs * (1.0 - merge * 0.4)))
                         b_at_a = np.array([a_pos[0], a_pos[1] + 0.4 * (1.0 - merge), a_pos[2] + 0.3 * (1.0 - merge)], dtype=np.float32)
-                        instances.append(_make_instance(b_at_a, self._set_alpha(self._colors_b[r, c], self.alpha * 0.8 * (1.0 - merge * 0.8)), self.bs * (1.0 - merge * 0.6)))
+                        instances.append(_make_instance(b_at_a, _set_alpha(self._colors_b[r, c], self.alpha * 0.8 * (1.0 - merge * 0.8)), self.bs * (1.0 - merge * 0.6)))
                         if merge > 0.3 and self.output_alpha_mult > 0.01:
                             c_alpha = smoothstep(0.3, 1.0, merge)
-                            instances.append(_make_instance(a_pos, self._set_alpha(self._colors_c[r, c], self.alpha * c_alpha * self.output_alpha_mult), self.bs * (0.5 + 0.5 * c_alpha)))
+                            instances.append(_make_instance(a_pos, _set_alpha(self._colors_c[r, c], self.alpha * c_alpha * self.output_alpha_mult), self.bs * (0.5 + 0.5 * c_alpha)))
                     else:
                         if self.output_alpha_mult > 0.01:
                             move = ease_in_out_cubic((ect - P2) / (1.0 - P2))
-                            pos = _lerp_pos(a_pos, c_pos, move)
-                            instances.append(_make_instance(pos, self._set_alpha(self._colors_c[r, c], self.alpha * self.output_alpha_mult), self.bs))
+                            pos = _bezier_pos(a_pos, c_pos, move, row=r, col=c)
+                            instances.append(_make_instance(pos, _set_alpha(self._colors_c[r, c], self.alpha * self.output_alpha_mult), self.bs))
 
         # === Depart ===
         if self.depart_t > 0.0 and self.to_origin_c is not None and self.output_alpha_mult > 0.01:
@@ -484,20 +589,13 @@ class AddVisual:
                 for c in range(cols):
                     src = _box_pos(self.origin_c, r, c, self.sp)
                     dst = _box_pos(self.to_origin_c, r, c, self.sp)
-                    pos = _lerp_pos(src, dst, dt_val)
-                    instances.append(_make_instance(pos, self._set_alpha(self._colors_c[r, c], self.alpha * self.output_alpha_mult), self.bs))
+                    pos = _bezier_pos(src, dst, dt_val, row=r, col=c)
+                    instances.append(_make_instance(pos, _set_alpha(self._colors_c[r, c], self.alpha * self.output_alpha_mult), self.bs))
 
-        if not instances:
-            return np.zeros((0, 10), dtype=np.float32)
-        return np.array(instances, dtype=np.float32)
-
-    def _set_alpha(self, color, alpha):
-        c = color.copy()
-        c[3] = alpha
-        return c
+        return _to_instance_array(instances)
 
 
-class ActivationVisual:
+class ActivationVisual(BaseVisual):
     """In-place transform with flow.
     appear: values fly in from from_origin
     compute: row-by-row color transition
@@ -505,6 +603,7 @@ class ActivationVisual:
     """
 
     def __init__(self, pre, post, origin, box_size=0.4, gap=0.1):
+        super().__init__()
         self.pre = pre
         self.post = post
         self.origin = np.array(origin, dtype=np.float32)
@@ -513,14 +612,6 @@ class ActivationVisual:
 
         self.from_origin = None
         self.to_origin = None
-
-        self.appear_t = 0.0
-        self.t = 0.0
-        self.depart_t = 0.0
-        self.alpha = 1.0
-        self.phase_group = 0
-        self.is_stage_output = False
-        self.output_alpha_mult = 1.0
 
         self._colors_pre = None
         self._colors_post = None
@@ -532,7 +623,7 @@ class ActivationVisual:
 
     def get_instance_data(self):
         if self.alpha < 0.01 or self.output_alpha_mult < 0.01:
-            return np.zeros((0, 10), dtype=np.float32)
+            return _EMPTY_INSTANCES
 
         self._ensure_colors()
         rows, cols = self.pre.shape
@@ -547,7 +638,7 @@ class ActivationVisual:
                     at = _wave_t(self.appear_t, r, c, rows, cols)
                     src = _box_pos(from_o, r, c, self.sp)
                     dst = _box_pos(self.origin, r, c, self.sp)
-                    pos = _lerp_pos(src, dst, at)
+                    pos = _bezier_pos(src, dst, at, row=r, col=c)
                     color = self._colors_pre[r, c].copy()
                     if seamless:
                         color[3] = self.alpha
@@ -555,7 +646,7 @@ class ActivationVisual:
                     else:
                         color[3] = self.alpha * at
                         instances.append(_make_instance(pos, color, self.bs * (0.3 + 0.7 * at)))
-            return np.array(instances, dtype=np.float32) if instances else np.zeros((0, 10), dtype=np.float32)
+            return _to_instance_array(instances)
 
         # === Compute: element-by-element color transition (diagonal wave) ===
         if self.t > 0.0 or self.appear_t >= 1.0:
@@ -578,20 +669,19 @@ class ActivationVisual:
                 for c in range(cols):
                     src = _box_pos(self.origin, r, c, self.sp)
                     dst = _box_pos(self.to_origin, r, c, self.sp)
-                    pos = _lerp_pos(src, dst, dt_val)
+                    pos = _bezier_pos(src, dst, dt_val, row=r, col=c)
                     color = self._colors_post[r, c].copy()
                     color[3] = self.alpha
                     instances.append(_make_instance(pos, color, self.bs))
 
-        if not instances:
-            return np.zeros((0, 10), dtype=np.float32)
-        return np.array(instances, dtype=np.float32)
+        return _to_instance_array(instances)
 
 
-class StaticMatrixVisual:
+class StaticMatrixVisual(BaseVisual):
     """Static matrix with flow support."""
 
     def __init__(self, matrix, origin, box_size=0.4, gap=0.1):
+        super().__init__()
         self.matrix = matrix
         self.origin = np.array(origin, dtype=np.float32)
         self.bs = box_size
@@ -599,14 +689,6 @@ class StaticMatrixVisual:
 
         self.from_origin = None
         self.to_origin = None
-
-        self.appear_t = 0.0
-        self.t = 0.0
-        self.depart_t = 0.0
-        self.alpha = 1.0
-        self.phase_group = 0
-        self.is_stage_output = False
-        self.output_alpha_mult = 1.0
 
         self._colors = None
 
@@ -616,7 +698,7 @@ class StaticMatrixVisual:
 
     def get_instance_data(self):
         if self.alpha < 0.01 or self.output_alpha_mult < 0.01:
-            return np.zeros((0, 10), dtype=np.float32)
+            return _EMPTY_INSTANCES
 
         self._ensure_colors()
         rows, cols = self.matrix.shape
@@ -630,7 +712,7 @@ class StaticMatrixVisual:
                     at = _wave_t(self.appear_t, r, c, rows, cols)
                     src = _box_pos(from_o, r, c, self.sp)
                     dst = _box_pos(self.origin, r, c, self.sp)
-                    pos = _lerp_pos(src, dst, at)
+                    pos = _bezier_pos(src, dst, at, row=r, col=c)
                     color = self._colors[r, c].copy()
                     if seamless:
                         color[3] = self.alpha
@@ -652,11 +734,9 @@ class StaticMatrixVisual:
                 for c in range(cols):
                     src = _box_pos(self.origin, r, c, self.sp)
                     dst = _box_pos(self.to_origin, r, c, self.sp)
-                    pos = _lerp_pos(src, dst, dt_val)
+                    pos = _bezier_pos(src, dst, dt_val, row=r, col=c)
                     color = self._colors[r, c].copy()
                     color[3] = self.alpha
                     instances.append(_make_instance(pos, color, self.bs))
 
-        if not instances:
-            return np.zeros((0, 10), dtype=np.float32)
-        return np.array(instances, dtype=np.float32)
+        return _to_instance_array(instances)

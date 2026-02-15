@@ -9,23 +9,9 @@ def ease_in_out_cubic(t: float) -> float:
         return 1.0 - (-2.0 * t + 2.0) ** 3 / 2.0
 
 
-def ease_out_quad(t: float) -> float:
-    t = np.clip(t, 0.0, 1.0)
-    return 1.0 - (1.0 - t) ** 2
-
-
 def ease_out_cubic(t: float) -> float:
     t = np.clip(t, 0.0, 1.0)
     return 1.0 - (1.0 - t) ** 3
-
-
-def ease_in_quad(t: float) -> float:
-    t = np.clip(t, 0.0, 1.0)
-    return t * t
-
-
-def lerp(a, b, t: float):
-    return a + (b - a) * np.clip(t, 0.0, 1.0)
 
 
 def smoothstep(edge0: float, edge1: float, x: float) -> float:

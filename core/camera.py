@@ -1,5 +1,6 @@
 import numpy as np
 from dataclasses import dataclass
+from animation.easing import smoothstep
 
 
 @dataclass
@@ -8,12 +9,6 @@ class CameraWaypoint:
     position: np.ndarray
     target: np.ndarray
     ortho_size: float = 10.0
-
-
-def smoothstep_interp(t):
-    """Hermite smoothstep for smooth transitions without overshoot."""
-    t = np.clip(t, 0.0, 1.0)
-    return t * t * (3.0 - 2.0 * t)
 
 
 class Camera:
@@ -93,7 +88,7 @@ class Camera:
         for i in range(len(self.waypoints) - 1):
             if self.waypoints[i].time <= t <= self.waypoints[i + 1].time:
                 seg_t = (t - self.waypoints[i].time) / (self.waypoints[i + 1].time - self.waypoints[i].time)
-                s = smoothstep_interp(seg_t)
+                s = smoothstep(0.0, 1.0, seg_t)
 
                 p0 = self.waypoints[i].position
                 p1 = self.waypoints[i + 1].position
