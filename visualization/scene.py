@@ -129,9 +129,11 @@ class Stage:
 
 
 class Scene:
-    def __init__(self, results: dict, config: TransformerConfig, shader):
+    def __init__(self, results: dict, config: TransformerConfig, shader,
+                 aspect: float = 16.0 / 9.0):
         self.results = results
         self.config = config
+        self.aspect = aspect
         self.timeline = AnimationTimeline()
         self.camera = Camera()
         self.renderer = InstancedBoxRenderer(shader)
@@ -585,7 +587,7 @@ class Scene:
         cam_up = np.cross(cam_right, cam_fwd)
 
         cam_dist = 200.0
-        assumed_aspect = 16.0 / 9.0
+        assumed_aspect = self.aspect
         margin = 2.0  # fixed view-space margin (same for every stage)
 
         def compute_framing(stage_name):

@@ -72,7 +72,8 @@ def setup(args):
     transformer = TransformerBlock(config)
     x = np.random.RandomState(123).randn(config.seq_len, config.d_model).astype(np.float32) * 0.5
     results = transformer.forward(x)
-    scene = Scene(results, config, box_shader)
+    aspect = w / max(h, 1)
+    scene = Scene(results, config, box_shader, aspect=aspect)
 
     gl.glEnable(gl.GL_DEPTH_TEST)
     gl.glEnable(gl.GL_BLEND)
