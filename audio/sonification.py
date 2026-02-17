@@ -1,5 +1,5 @@
 """
-Transformer Visualizer — Data Sonification
+GPT Visualizer — Data Sonification
 ===========================================
 Ultra-short sine blips, digital clicks, needle tones,
 white noise bursts. Sounds fire ONLY on discrete events
@@ -36,7 +36,8 @@ def _click(dur_samples, polarity=1.0):
 
 
 def _needle(freq, dur_samples):
-    """Ultra-high frequency needle tone with exponential decay."""
+    """High frequency needle tone with exponential decay."""
+    freq = min(freq, 5000)
     te = np.linspace(0, dur_samples / SR, dur_samples, endpoint=False)
     return np.sin(2 * np.pi * freq * te) * np.exp(-te * 300)
 
@@ -66,15 +67,16 @@ def _freq_sweep(f_start, f_end, dur_samples):
 
 # ─── Event → Sound Mapping ──────────────────────────────────────────
 
-SOUND_KINDS = ['sine_blip', 'click', 'needle', 'white_burst', 'data_tone']
+SOUND_KINDS   = ['needle', 'click', 'sine_blip', 'white_burst', 'data_tone']
+SOUND_WEIGHTS = [0.45,     0.35,    0.05,        0.05,          0.10]
 
 # Global RNG for randomizing sound types (seeded for reproducibility)
 _event_rng = np.random.RandomState(777)
 
 
 def _rand_kind():
-    """Pick a random micro-sound type."""
-    return _event_rng.choice(SOUND_KINDS)
+    """Pick a weighted-random micro-sound type (favors needle & click)."""
+    return _event_rng.choice(SOUND_KINDS, p=SOUND_WEIGHTS)
 
 
 def _rand_dur():
@@ -83,9 +85,9 @@ def _rand_dur():
 
 
 def _val_to_freq(val, vmax):
-    """Map a matrix value to frequency (200–15000 Hz)."""
+    """Map a matrix value to frequency (200–5000 Hz)."""
     normalized = abs(val) / max(vmax, 1e-6)
-    return 200 + 14800 * min(normalized, 1.0)
+    return 200 + 4800 * min(normalized, 1.0)
 
 
 def _val_to_vol(val, vmax, lo=0.05, hi=0.3):
@@ -204,6 +206,60 @@ def events_relu(pre, post, t_start, duration):
     return events
 
 
+def events_row_select(probs, pred_pos, t_start, duration):
+    """Row selection: prediction row elements sound as they scale by probability."""
+    rows, cols = probs.shape
+    events = []
+
+    # Phase 1 (0-40%): non-prediction rows fade — quiet downward sweeps
+    fade_dur = duration * 0.4
+    for r in range(rows):
+        if r == pred_pos:
+            continue
+        row_max = max(np.max(np.abs(probs[r])), 0.01)
+        # One sweep per fading row
+        t = t_start + fade_dur * (r / max(rows - 1, 1))
+        freq = 200 + 800 * (row_max / max(np.max(np.abs(probs)), 0.01))
+        events.append((t, 'sweep', freq, 0.06, 4.0, freq * 0.3))
+
+    # Phase 2 (30-100%): prediction row scales up — sound per column
+    scale_start = t_start + duration * 0.3
+    scale_dur = duration * 0.7
+    row = probs[pred_pos]
+    for c in range(cols):
+        p = row[c]
+        if p < 0.003:
+            continue
+        t = scale_start + scale_dur * (c / max(cols - 1, 1))
+        freq = 250 + 4000 * p
+        vol = 0.04 + 0.22 * p
+        dur_ms = 1.5 + 8.0 * p
+        events.append((t, _rand_kind(), freq, vol, dur_ms))
+
+    return events
+
+
+def events_argmax(probs, pred_pos, t_start, duration):
+    """Argmax scan: sound per token proportional to its probability."""
+    row = probs[pred_pos]
+    cols = len(row)
+    events = []
+
+    for c in range(cols):
+        p = row[c]
+        if p < 0.005:
+            continue
+        # Sweep left-to-right across columns
+        t = t_start + duration * (c / max(cols - 1, 1))
+        # Higher probability → higher pitch and louder
+        freq = 300 + 4000 * p
+        vol = 0.04 + 0.26 * p
+        dur_ms = 1.0 + 7.0 * p
+        events.append((t, _rand_kind(), freq, vol, dur_ms))
+
+    return events
+
+
 def events_add(A, B, C, t_start, duration):
     """Residual add: random sounds at fly, merge, and emerge moments."""
     rows, cols = A.shape
@@ -302,7 +358,7 @@ def render_events(events, total_samples):
     return out
 
 
-# ─── Highpass (minimal DSP) ──────────────────────────────────────────
+# ─── Minimal DSP ──────────────────────────────────────────────────────
 
 def _highpass_simple(x, cutoff=30):
     """Single-pole highpass to remove DC."""
@@ -316,11 +372,42 @@ def _highpass_simple(x, cutoff=30):
     return y
 
 
+def _compress(x, threshold=0.12, ratio=4.0, attack_s=0.005, release_s=0.08):
+    """Dynamic range compressor to even out volume across stages.
+
+    Loud sections (matmul with many overlapping events) are reduced,
+    quiet sections (sparse clicks) are preserved, then peak-normalize
+    at the end brings everything to a consistent level.
+    """
+    n = len(x)
+    att = np.exp(-1.0 / max(attack_s * SR, 1))
+    rel = np.exp(-1.0 / max(release_s * SR, 1))
+
+    # Envelope follower (peak detector with attack/release smoothing)
+    env = np.zeros(n)
+    env[0] = abs(x[0])
+    for i in range(1, n):
+        sample = abs(x[i])
+        if sample > env[i - 1]:
+            env[i] = att * env[i - 1] + (1.0 - att) * sample
+        else:
+            env[i] = rel * env[i - 1] + (1.0 - rel) * sample
+
+    # Gain: compress above threshold
+    # gain = (env / threshold) ^ (1/ratio - 1)  for env > threshold
+    gain = np.ones(n)
+    above = env > threshold
+    gain[above] = (env[above] / threshold) ** (1.0 / ratio - 1.0)
+
+    return x * gain
+
+
 # ─── Main Composition ───────────────────────────────────────────────
 
-def build_soundtrack(results, config):
+def build_soundtrack(results, config, timeline=None, logits_only=False):
     """Build the complete data sonification soundtrack from transformer events."""
-    timeline = AnimationTimeline()
+    if timeline is None:
+        timeline = AnimationTimeline()
     total_duration = timeline.total_duration + timeline.return_duration
     total_samples = int(total_duration * SR)
 
@@ -342,9 +429,9 @@ def build_soundtrack(results, config):
         print(f"    {name}: t={t0:.1f}s  "
               f"[appear {appear_dur:.1f}s | compute {compute_dur:.1f}s]")
 
-        # ── Input: elements appear ──
+        # ── Input: silent (no sound on initial appear) ──
         if name == 'input':
-            all_events += events_appear(results['input'], t_appear, appear_dur)
+            pass
 
         # ── QKV Projection ──
         elif name == 'qkv_projection':
@@ -477,6 +564,64 @@ def build_soundtrack(results, config):
         elif name == 'output':
             all_events += events_appear(results['output'], t_appear, appear_dur)
 
+        # ── Blocks 2-4: simplified transition ──
+        elif name in ('block_2', 'block_3', 'block_4'):
+            # stage block_N shows transition: block_{N-2} output → block_{N-1} output
+            n = int(name.split('_')[1])
+            pre_key = f'block_{n - 2}'
+            post_key = f'block_{n - 1}'
+            if pre_key in results and 'output' in results[pre_key]:
+                all_events += events_appear(
+                    results[pre_key]['output'], t_appear, appear_dur)
+                if compute_dur > 0 and post_key in results and 'output' in results[post_key]:
+                    all_events += events_softmax(
+                        results[pre_key]['output'],
+                        results[post_key]['output'],
+                        t_compute, compute_dur)
+
+        # ── Output Projection: matmul ──
+        elif name == 'output_projection':
+            if 'W_out' in results and 'logits' in results:
+                all_events += events_appear(
+                    results['output'], t_appear, appear_dur)
+                if compute_dur > 0:
+                    all_events += events_matmul(
+                        results['output'], results['W_out'],
+                        results['logits'], t_compute, compute_dur)
+
+        # ── Token Probabilities: softmax + selection ──
+        elif name == 'token_probs':
+            if 'logits' in results and 'probs' in results:
+                if not logits_only:
+                    all_events += events_appear(
+                        results['logits'], t_appear, appear_dur)
+                for gi, (seg_s, seg_e) in enumerate(stage.group_segments):
+                    seg_dur = (seg_e - seg_s) * compute_dur
+                    seg_t = t_compute + seg_s * compute_dur
+                    if seg_dur <= 0:
+                        continue
+                    if gi == 0:
+                        all_events += events_softmax(
+                            results['logits'], results['probs'],
+                            seg_t, seg_dur)
+                    elif gi == 1:
+                        # Row selection: prediction row scales, others fade
+                        pred_pos = int(results.get('pred_pos', 0))
+                        all_events += events_row_select(
+                            results['probs'], pred_pos, seg_t, seg_dur)
+                    elif gi == 2:
+                        # Argmax: sound proportional to probability
+                        pred_pos = int(results.get('pred_pos', 0))
+                        probs = results['probs']
+                        all_events += events_argmax(
+                            probs, pred_pos, seg_t, seg_dur)
+
+        # ── Char Display: minimal appear sound ──
+        elif name == 'char_display':
+            if appear_dur > 0:
+                all_events += events_appear(
+                    results['input'][:1, :], t_appear, appear_dur)
+
     print(f"\n  Total events: {len(all_events)}")
     print("  Rendering audio...")
 
@@ -484,6 +629,19 @@ def build_soundtrack(results, config):
 
     # Remove DC
     mono = _highpass_simple(mono, 30)
+
+    # Tame harsh highs with simple single-pole lowpass
+    _lp_rc = 1.0 / (2 * np.pi * 6000)
+    _lp_dt = 1.0 / SR
+    _lp_alpha = _lp_dt / (_lp_rc + _lp_dt)
+    lp_out = np.zeros_like(mono)
+    lp_out[0] = mono[0]
+    for i in range(1, len(mono)):
+        lp_out[i] = lp_out[i - 1] + _lp_alpha * (mono[i] - lp_out[i - 1])
+    mono = lp_out
+
+    # Compress dynamics so loud/quiet sections are more even
+    mono = _compress(mono)
 
     # Normalize
     peak = np.max(np.abs(mono))

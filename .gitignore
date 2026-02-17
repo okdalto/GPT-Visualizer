@@ -4,5 +4,6 @@ __pycache__/
 .claude/
 data/
 recordings/
+transformer/weights/
 .DS_Store
 *.wav

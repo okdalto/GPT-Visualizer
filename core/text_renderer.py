@@ -7,6 +7,7 @@ from core.shader import ShaderProgram
 
 
 STAGE_DISPLAY_NAMES = {
+    'char_display':       'Input Characters',
     'input':              'Input Embeddings',
     'qkv_projection':     'QKV Projection',
     'multi_head_attn':    'Multi-Head Attention',
@@ -14,7 +15,12 @@ STAGE_DISPLAY_NAMES = {
     'residual_ln1':       'Residual + LayerNorm 1',
     'ffn':                'Feed-Forward Network',
     'residual_ln2':       'Residual + LayerNorm 2',
-    'output':             'Output',
+    'output':             'Block 1 Output',
+    'block_2':            'Block 2',
+    'block_3':            'Block 3',
+    'block_4':            'Block 4',
+    'output_projection':  'Vocabulary Projection',
+    'token_probs':        'Token Probabilities',
 }
 
 MAX_CHARS = 256
@@ -61,12 +67,15 @@ class TextRenderer:
 
             bbox = font.getbbox(ch)
             advance = bbox[2] - bbox[0] + 1
+            # render_width: pixels from draw position to just past ink right edge.
+            # Covers the full glyph even when bbox[0] > 0 (left bearing).
+            render_width = bbox[2] + 2
 
             u0 = x / atlas_w
             v0 = y / atlas_h
             u1 = (x + self.cell_w - pad) / atlas_w
             v1 = (y + self.cell_h - pad) / atlas_h
-            self.char_info[ch] = (u0, v0, u1, v1, advance)
+            self.char_info[ch] = (u0, v0, u1, v1, advance, render_width)
 
         # Reserve a solid-white 1x1 pixel at top-left corner for background quads
         img.putpixel((0, 0), 255)
@@ -168,12 +177,16 @@ class TextRenderer:
 
         return np.array(verts, dtype=np.float32), len(text) * 6
 
-    def _build_quads_3d(self, text: str, origin, char_height: float = 0.5):
-        """Build 3D world-space quads on the XY plane, centered at origin.
+    def _build_quads_3d(self, text: str, origin, char_height: float = 0.5,
+                        align: str = 'center'):
+        """Build 3D world-space quads on the XY plane at origin.
 
         Characters progress in -X direction (high X → low X) because the
         camera views from azimuth π/4 where world +X points camera-left.
         U coordinates are swapped to correct the horizontal mirroring.
+
+        align='center': text centered at origin (default)
+        align='left':   text left-edge (screen-left = high X) at origin
         """
         scale = char_height / max(self.cell_h, 1)
 
@@ -187,10 +200,12 @@ class TextRenderer:
 
         verts = []
         # Start at high X (camera-left) and advance toward low X (camera-right)
-        cx = origin[0] + total_world_width / 2
+        if align == 'left':
+            cx = origin[0]  # anchor at screen-left (high X)
+        else:
+            cx = origin[0] + total_world_width / 2
         y_base = origin[1]
         z = origin[2]
-        char_w = (self.cell_w - 2) * scale
 
         for ch in text:
             info = self.char_info.get(ch)
@@ -200,9 +215,14 @@ class TextRenderer:
                     continue
             u0, v0_atlas, u1, v1_atlas = info[0], info[1], info[2], info[3]
             advance = info[4]
+            render_width = info[5]
 
             v0 = 1.0 - v1_atlas
             v1 = 1.0 - v0_atlas
+
+            # Quad width uses render_width (covers full glyph including bearing)
+            char_w = render_width * scale
+            u1_glyph = u0 + render_width / self.atlas_w
 
             x0 = cx - char_w  # low X = camera-right = glyph right
             x1 = cx            # high X = camera-left = glyph left
@@ -212,28 +232,32 @@ class TextRenderer:
             # Swap u0/u1: x1 (camera-left) gets u0 (glyph-left),
             #              x0 (camera-right) gets u1 (glyph-right)
             verts.extend([
-                x0, y0, z, u1, v0,
+                x0, y0, z, u1_glyph, v0,
                 x1, y0, z, u0, v0,
                 x1, y1, z, u0, v1,
-                x0, y0, z, u1, v0,
+                x0, y0, z, u1_glyph, v0,
                 x1, y1, z, u0, v1,
-                x0, y1, z, u1, v1,
+                x0, y1, z, u1_glyph, v1,
             ])
             cx -= advance * scale
 
         return np.array(verts, dtype=np.float32), len(text) * 6
 
     def _build_bg_quad_3d(self, origin, text_world_width, char_height,
-                          padding: float = 0.15):
+                          padding: float = 0.15, align: str = 'center'):
         """Build a semi-transparent background quad behind 3D text."""
         su, sv = self.solid_uv
-        hw = text_world_width / 2 + padding
         h = char_height + padding * 0.6
 
         # Background extends slightly beyond text bounds
         # X reversed: high X = camera-left, low X = camera-right
-        x0 = origin[0] - hw
-        x1 = origin[0] + hw
+        if align == 'left':
+            x0 = origin[0] - text_world_width - padding
+            x1 = origin[0] + padding
+        else:
+            hw = text_world_width / 2 + padding
+            x0 = origin[0] - hw
+            x1 = origin[0] + hw
         y0 = origin[1] - padding * 0.3
         y1 = origin[1] + h
         z = origin[2]
@@ -303,17 +327,22 @@ class TextRenderer:
     def render_text_3d(self, text: str, origin, view, proj,
                        char_height: float = 0.5,
                        color=(1.0, 1.0, 1.0, 1.0),
-                       bg_color=(0.0, 0.0, 0.0, 0.92)):
-        """Render text in world space on the XY plane, centered at origin.
+                       bg_color=(0.0, 0.0, 0.0, 0.92),
+                       align: str = 'center'):
+        """Render text in world space on the XY plane at origin.
 
         Text is transformed by view and projection matrices like 3D geometry,
         so it rotates with the camera and is naturally depth-tested.
         Draws a semi-transparent background quad behind the text.
+
+        align='center': text centered at origin (default)
+        align='left':   text left-edge (screen-left = high X) at origin
         """
         if not text:
             return
 
-        vertex_data, num_verts = self._build_quads_3d(text, origin, char_height)
+        vertex_data, num_verts = self._build_quads_3d(text, origin, char_height,
+                                                       align=align)
         if num_verts == 0:
             return
 
@@ -331,7 +360,8 @@ class TextRenderer:
         # In ortho projection this changes depth only, not screen position.
         fwd = -np.array([view[2, 0], view[2, 1], view[2, 2]], dtype=np.float32)
         bg_origin = np.array(origin, dtype=np.float32) + fwd * 0.15
-        bg_data = self._build_bg_quad_3d(bg_origin, text_world_width, char_height)
+        bg_data = self._build_bg_quad_3d(bg_origin, text_world_width, char_height,
+                                         align=align)
 
         gl.glEnable(gl.GL_DEPTH_TEST)
         gl.glDepthMask(gl.GL_FALSE)  # read-only: don't write to depth buffer

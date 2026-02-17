@@ -13,6 +13,9 @@ import os
 
 from audio.common import SR, write_wav
 
+# Seeded RNG for reproducible audio synthesis
+_rng = np.random.RandomState(12345)
+
 # ─── Global Parameters ───────────────────────────────────────────────
 BPM = 155            # FAST industrial tempo
 DURATION = 120
@@ -177,7 +180,7 @@ def synth_kick(length_s=0.25):
     osc = soft_clip(osc * 1.5, 0.7)
 
     # Click transient
-    click = np.random.randn(n) * np.exp(-t * 800) * 0.4
+    click = _rng.randn(n) * np.exp(-t * 800) * 0.4
 
     amp = np.exp(-t * 12) * (1 - np.exp(-t * 800))
     sub = np.sin(2 * np.pi * 45 * t) * np.exp(-t * 10) * 0.4
@@ -193,7 +196,7 @@ def synth_hihat(length_s=0.03, open_hat=False):
     n = int(length_s * SR)
     t = np.linspace(0, length_s, n, endpoint=False)
 
-    noise = np.random.randn(n)
+    noise = _rng.randn(n)
 
     # Harsh metallic resonances
     metallic = np.zeros(n)
@@ -201,7 +204,7 @@ def synth_hihat(length_s=0.03, open_hat=False):
         metallic += square_wave(2 * np.pi * freq * t) * 0.12
 
     raw = noise * 0.5 + metallic * 0.5
-    filtered = highpass(raw, 7000)
+    filtered = highpass(raw, 5000)
 
     if open_hat:
         amp = np.exp(-t * 20) * (1 - np.exp(-t * 3000))
@@ -240,7 +243,7 @@ def synth_machine_noise(length_s=0.05):
     n = int(length_s * SR)
     t = np.linspace(0, length_s, n, endpoint=False)
 
-    noise = np.random.randn(n)
+    noise = _rng.randn(n)
     # Resonant bandpass
     filtered = bandpass(noise, 2000, 5000)
     # Bitcrush for digital grit
@@ -257,7 +260,7 @@ def synth_clap(length_s=0.1):
     n = int(length_s * SR)
     t = np.linspace(0, length_s, n, endpoint=False)
 
-    noise = np.random.randn(n)
+    noise = _rng.randn(n)
     filtered = bandpass(noise, 1200, 7000)
 
     env = np.zeros(n)
@@ -374,7 +377,7 @@ def gen_machine_gun(length_s, seed=99):
         hit_type = rng.choice(['metal', 'noise', 'click', 'zap'])
 
         if hit_type == 'metal':
-            freq = rng.choice([600, 900, 1200, 1800, 2400, 3600])
+            freq = rng.choice([600, 900, 1200, 1800, 2400])
             hit = synth_metal_hit(length_s=rng.uniform(0.02, 0.06),
                                   freq_base=freq)
             vol = rng.uniform(0.15, 0.35)
@@ -384,12 +387,12 @@ def gen_machine_gun(length_s, seed=99):
         elif hit_type == 'click':
             cl = int(rng.uniform(0.001, 0.008) * SR)
             hit = rng.randn(cl) * np.exp(-np.linspace(0, 1, cl) * 20)
-            hit = highpass(hit, 3000)
+            hit = highpass(hit, 2000)
             vol = rng.uniform(0.15, 0.4)
         else:  # zap - short pitched blip
             cl = int(0.015 * SR)
             te = np.linspace(0, 0.015, cl, endpoint=False)
-            freq_sweep = 4000 * np.exp(-te * 200) + 200
+            freq_sweep = 3000 * np.exp(-te * 200) + 200
             ph = 2 * np.pi * np.cumsum(freq_sweep) / SR
             hit = np.sin(ph) * np.exp(-te * 150)
             vol = rng.uniform(0.1, 0.3)
@@ -441,12 +444,12 @@ def gen_glitch_texture(length_s, density=0.45, seed=42):
                 te = np.linspace(0, event_len / SR, event_len, endpoint=False)
 
                 if event_type == 'grain':
-                    freq = rng.uniform(200, 10000)
+                    freq = rng.uniform(200, 5000)
                     grain = np.sin(2 * np.pi * freq * te) * np.hanning(event_len)
                 elif event_type == 'click':
                     grain = rng.randn(event_len) * np.exp(-te * 800)
                 elif event_type == 'blip':
-                    freq = rng.choice([440, 880, 1760, 3520])
+                    freq = rng.choice([440, 880, 1760, 2500])
                     grain = np.sin(2 * np.pi * freq * te) * np.exp(-te * 150)
                 elif event_type == 'stutter':
                     freq = rng.uniform(100, 500)
@@ -517,7 +520,7 @@ def gen_arpeggio(length_s, root=220):
         end = min(pos + note_len, n)
         out[pos:end] += osc[:end - pos]
 
-    out = bandpass(out, 800, 14000)
+    out = bandpass(out, 800, 8000)
     out = delay_effect(out, delay_time=BEAT * 0.5, feedback=0.25, mix=0.25)
     return out
 
@@ -563,7 +566,7 @@ def gen_data_stream(length_s, seed=314):
             # Pure sine micro-tone
             dur = int(rng.uniform(0.0005, 0.008) * SR)
             dur = min(dur, n - pos)
-            freq = rng.choice([1000, 2000, 4000, 6000, 8000, 12000, 15000])
+            freq = rng.choice([1000, 2000, 3000, 4000, 5000])
             te = np.linspace(0, dur / SR, dur, endpoint=False)
             grain = np.sin(2 * np.pi * freq * te)
             grain *= np.hanning(dur)
@@ -581,10 +584,10 @@ def gen_data_stream(length_s, seed=314):
             vol = rng.uniform(0.3, 0.6)
 
         elif event == 'needle':
-            # Ultra-high frequency needle tone
+            # High frequency needle tone
             dur = int(rng.uniform(0.003, 0.02) * SR)
             dur = min(dur, n - pos)
-            freq = rng.uniform(10000, 18000)
+            freq = rng.uniform(3000, 6000)
             te = np.linspace(0, dur / SR, dur, endpoint=False)
             grain = np.sin(2 * np.pi * freq * te)
             grain *= np.exp(-te * 300)
@@ -848,7 +851,8 @@ def gen_test_pattern_sweeps(length_s, seed=619):
             f_start = rng.choice([100, 200, 500, 1000, 2000])
             if rng.random() < 0.5:
                 # Ascending sweep
-                f_end = f_start * rng.uniform(4, 40)
+                f_end = f_start * rng.uniform(4, 20)
+                f_end = min(f_end, 6000)
             else:
                 # Descending sweep
                 f_end = f_start / rng.uniform(2, 10)
@@ -871,7 +875,7 @@ def gen_test_pattern_sweeps(length_s, seed=619):
             # CALIBRATION TONE BURST (exact frequency, precise duration)
             tone_dur = int(rng.choice([0.005, 0.01, 0.02, 0.05, 0.1]) * SR)
             tone_dur = min(tone_dur, n - pos)
-            freq = rng.choice([100, 400, 1000, 4000, 8000, 12000, 16000])
+            freq = rng.choice([100, 400, 1000, 2500, 4000, 5000, 6000])
             tt = np.linspace(0, tone_dur / SR, tone_dur, endpoint=False)
             grain = np.sin(2 * np.pi * freq * tt)
             # Rectangle window with tiny fade to avoid clicks
@@ -918,7 +922,7 @@ def gen_noise_riser(length_s, start_time, rise_duration=8.0):
     rise_samples = int(rise_duration * SR)
     end_sample = min(start_sample + rise_samples, n)
 
-    noise = np.random.randn(end_sample - start_sample) * 0.3
+    noise = _rng.randn(end_sample - start_sample) * 0.3
     t_rise = np.linspace(0, 1, end_sample - start_sample)
 
     # Sweep filter from 200Hz to 8000Hz
@@ -1228,9 +1232,8 @@ def build_arrangement():
     # Harder compression/saturation for industrial sound
     mix = soft_clip(mix * 1.5, threshold=0.75)
 
-    # Presence + air EQ
-    presence = bandpass(mix, 3500, 10000)
-    mix = mix + presence * 0.12
+    # Gentle lowpass to tame harsh highs
+    mix = lowpass(mix, 8000, order=2)
 
     # Stereo
     left = mix.copy()
@@ -1241,8 +1244,8 @@ def build_arrangement():
     left = left + reverb_simple(left, decay=0.12, delays_ms=(23, 37, 53)) * 0.06
     right = right + reverb_simple(right, decay=0.12, delays_ms=(29, 41, 59)) * 0.06
 
-    left += np.random.randn(total_samples) * 0.0008
-    right += np.random.randn(total_samples) * 0.0008
+    left += _rng.randn(total_samples) * 0.0008
+    right += _rng.randn(total_samples) * 0.0008
 
     stereo = np.column_stack([left, right])
     peak = np.max(np.abs(stereo))

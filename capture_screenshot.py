@@ -1,4 +1,4 @@
-"""Capture a single high-res JPG screenshot from the Transformer Block Visualizer.
+"""Capture a single high-res JPG screenshot from the GPT Visualizer.
 
 Usage:
     python capture_screenshot.py [--time TIME_SEC] [--output PATH]
@@ -47,13 +47,15 @@ def capture_screenshot(target_time: float, out_path: str):
     transformer = TransformerBlock(config)
     x = np.random.RandomState(123).randn(config.seq_len, config.d_model).astype(np.float32) * 0.5
     results = transformer.forward(x)
-    scene = Scene(results, config, box_shader)
+    fb_w, fb_h = app.get_framebuffer_size()
+    aspect = fb_w / max(fb_h, 1)
+    scene = Scene(results, config, box_shader, aspect=aspect)
 
     gl.glEnable(gl.GL_DEPTH_TEST)
     gl.glEnable(gl.GL_BLEND)
     gl.glBlendFunc(gl.GL_SRC_ALPHA, gl.GL_ONE_MINUS_SRC_ALPHA)
     gl.glEnable(gl.GL_MULTISAMPLE)
-    gl.glClearColor(0.08, 0.08, 0.12, 1.0)
+    gl.glClearColor(0.0, 0.0, 0.0, 1.0)
 
     # Advance timeline to target time
     scene.timeline.playing = False
@@ -67,9 +69,6 @@ def capture_screenshot(target_time: float, out_path: str):
     # Set exact time and do final update
     scene.timeline.current_time = target_time
     scene.update(0.0)
-
-    fb_w, fb_h = app.get_framebuffer_size()
-    aspect = fb_w / max(fb_h, 1)
 
     # Render the frame
     gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
@@ -91,7 +90,9 @@ def capture_screenshot(target_time: float, out_path: str):
     if fb_w > width:
         img = img.resize((width, height), Image.LANCZOS)
 
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    out_dir = os.path.dirname(out_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     img.save(out_path, "JPEG", quality=95)
     size_kb = os.path.getsize(out_path) / 1024
     print(f"Saved {out_path} ({img.size[0]}x{img.size[1]}, {size_kb:.0f}KB)")
@@ -105,7 +106,7 @@ def capture_screenshot(target_time: float, out_path: str):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Capture a screenshot from Transformer Visualizer")
+    parser = argparse.ArgumentParser(description="Capture a screenshot from GPT Visualizer")
     parser.add_argument("--time", type=float, default=None,
                         help="Time in seconds to capture (default: auto-pick multi-head attention)")
     parser.add_argument("--output", type=str, default=None,

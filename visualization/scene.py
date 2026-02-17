@@ -12,6 +12,10 @@ from visualization.layout import (
     RESIDUAL_ADD_Z,
     FFN_W1_Z, FFN_PRERELU_Z,
 )
+from visualization.colormap import (
+    matrix_to_colors_sequential, matrix_to_colors_sequential_per_row,
+    matrix_to_colors_sequential_per_row_fade, matrix_to_colors_sequential_fade,
+)
 from transformer.parameters import TransformerConfig
 
 
@@ -85,7 +89,7 @@ class Stage:
                     v.t = 0.0
                 elif t < seg_end:
                     # Active segment
-                    local_t = (t - seg_start) / (seg_end - seg_start)
+                    local_t = (t - seg_start) / max(seg_end - seg_start, 1e-9)
                     v.alpha = 1.0
                     if g == 0:
                         v.appear_t = 1.0
@@ -130,15 +134,38 @@ class Stage:
 
 class Scene:
     def __init__(self, results: dict, config: TransformerConfig, shader,
-                 aspect: float = 16.0 / 9.0):
+                 aspect: float = 16.0 / 9.0,
+                 input_labels: list[str] = None,
+                 output_labels: list[str] = None,
+                 renderer=None,
+                 final_display: bool = False,
+                 logits_only: bool = False):
         self.results = results
         self.config = config
+        self.input_labels = input_labels
+        self.output_labels = output_labels
         self.aspect = aspect
-        self.timeline = AnimationTimeline()
+        self.final_display = final_display
+        self.logits_only = logits_only
+        self.has_lm_head = 'logits' in results
+        active = [l for l in (input_labels or []) if l not in ('_', '<END>')]
+        self.has_char_display = len(active) > 0
+        self.timeline = AnimationTimeline(
+            has_lm_head=self.has_lm_head,
+            has_char_display=self.has_char_display,
+            final_display=self.final_display,
+            logits_only=self.logits_only,
+        )
+        if self.final_display:
+            self.timeline.loop = False
+            self.timeline.return_duration = 0.0
         self.camera = Camera()
-        self.renderer = InstancedBoxRenderer(shader)
+        self.renderer = renderer or InstancedBoxRenderer(shader)
         self.shader = shader
 
+        self._char_display_data = []   # [(char, start_pos, row_idx)]
+        self._char_spacing = 2.5       # default, updated in _build_all_stages
+        self._char_end_positions = {}  # row_idx -> end_pos
         self.stages: dict[str, Stage] = {}
         self._build_all_stages()
         # Copy per-group segment boundaries from timeline to stages
@@ -158,6 +185,47 @@ class Scene:
         c = self.config
         bs = 0.4
         gap = 0.1
+
+        # =========================================================
+        # Stage 0: Character Display (text mode only)
+        # Shows input characters big, then flies them to input row positions
+        # =========================================================
+        if self.has_char_display:
+            active_chars = [(i, lbl) for i, lbl in enumerate(self.input_labels)
+                            if lbl not in ('_', '<END>')]
+            n_active = len(active_chars)
+            z_cd = STAGE_Z['char_display']
+            # Wider spacing for few chars, tighter for many (prevents overlap)
+            char_spacing = max(2.0, 4.5 - n_active * 0.15)
+            self._char_spacing = char_spacing
+
+            # Dummy visual (boxes hidden; only used so the stage has a visual)
+            total_w = (n_active - 1) * char_spacing
+            dummy = StaticMatrixVisual(
+                np.zeros((2, 2), dtype=np.float32),
+                matrix_origin(z_cd, SPACING / 2, 2 + SPACING / 2),
+                box_size=bs, gap=gap,
+            )
+            dummy.phase_group = 0
+            stage = Stage('char_display')
+            stage.visuals.append(dummy)
+            self.stages['char_display'] = stage
+
+            # Store animated char data (start positions centered horizontally)
+            for idx, (row_idx, char_label) in enumerate(active_chars):
+                start_pos = np.array([
+                    total_w / 2 - idx * char_spacing,
+                    2,
+                    z_cd,
+                ], dtype=np.float32)
+                self._char_display_data.append((char_label, start_pos, row_idx))
+
+        if self.final_display:
+            return
+
+        if self.logits_only:
+            self._build_logits_only_stages(r, c, bs, gap)
+            return
 
         # =========================================================
         # Stage 1: Input Embeddings
@@ -370,15 +438,111 @@ class Scene:
             r['residual2'], r['layernorm2'], w16, bs, gap)
 
         # =========================================================
-        # Stage 8: Output
+        # Stage 8: Block 1 Output
         # =========================================================
+        block0_output = r['block_0']['output'] if 'block_0' in r else r['output']
         stage = Stage('output')
         z = STAGE_Z['output']
         w_out = c.d_model * SPACING
-        v = StaticMatrixVisual(r['output'], matrix_origin(z, -w_out / 2, 2), bs, gap)
+        v = StaticMatrixVisual(block0_output, matrix_origin(z, -w_out / 2, 2), bs, gap)
         v.phase_group = 0
         stage.visuals.append(v)
         self.stages['output'] = stage
+
+        # =========================================================
+        # Stages 9-11: Blocks 2-4 (simplified: in-place transition)
+        # =========================================================
+        for blk_idx, blk_name in enumerate(['block_2', 'block_3', 'block_4'], start=1):
+            if f'block_{blk_idx}' not in r:
+                break
+            pre = r[f'block_{blk_idx - 1}']['output']
+            post = r[f'block_{blk_idx}']['output']
+            z_blk = STAGE_Z[blk_name]
+            stage = Stage(blk_name)
+            v = ActivationVisual(pre, post, matrix_origin(z_blk, -w_out / 2, 2), bs, gap)
+            v.phase_group = 0
+            stage.visuals.append(v)
+            self.stages[blk_name] = stage
+
+        # =========================================================
+        # Output Projection (LM head only)
+        # Uses final block's output
+        # =========================================================
+        final_output = r['output']
+        if 'logits' in r:
+            stage = Stage('output_projection')
+            # Place A at final block's Z
+            z_out = STAGE_Z.get('block_4', STAGE_Z['output'])
+            if 'block_3' not in r:
+                z_out = STAGE_Z['output']
+            vocab_size = r['logits'].shape[1]
+            w_vocab = vocab_size * SPACING
+            w_model = c.d_model * SPACING
+            c_x = -w_model / 2 - MATRIX_X_GAP - w_vocab
+
+            v = MatmulVisual(
+                A=final_output, B=r['W_out'], C=r['logits'],
+                origin_a=matrix_origin(z_out, -w_model / 2, 2),
+                origin_b=matrix_origin(z_out + MATMUL_Z_B, -w_model / 2, 2),
+                origin_c=matrix_origin(z_out + MATMUL_Z_C, c_x, 2),
+                box_size=bs, gap=gap,
+            )
+            v.phase_group = 0
+            v.is_stage_output = True
+            stage.visuals.append(v)
+            self.stages['output_projection'] = stage
+
+            # =========================================================
+            # Stage 10: Token Probabilities (LM head only)
+            # Group 0: logits → probs (softmax)
+            # Group 1: probs → row_probs (fade non-prediction rows)
+            # Group 2: row_probs → token_selected (argmax within row)
+            # =========================================================
+            stage = Stage('token_probs')
+            z_tp = STAGE_Z['token_probs']
+            logits_origin = matrix_origin(z_tp, -w_vocab / 2, 2)
+
+            # Derive intermediate matrices from pred_pos
+            pred_pos = int(r.get('pred_pos', 0))
+            row_probs = np.zeros_like(r['probs'])
+            row_probs[pred_pos] = r['probs'][pred_pos]
+
+            token_selected = np.zeros_like(r['probs'])
+            best_j = int(np.argmax(r['probs'][pred_pos]))
+            token_selected[pred_pos, best_j] = 1.0
+
+            # Group 0: softmax (logits → probs, full 8×28)
+            v = ActivationVisual(
+                pre=r['logits'], post=r['probs'],
+                origin=logits_origin.copy(),
+                box_size=bs, gap=gap,
+            )
+            v.phase_group = 0
+            v.color_fn_post = lambda m, a: matrix_to_colors_sequential_per_row(m, a)
+            stage.visuals.append(v)
+
+            # Group 1: row selection (fade out non-prediction rows)
+            v = ActivationVisual(
+                pre=r['probs'], post=row_probs,
+                origin=logits_origin.copy(),
+                box_size=bs, gap=gap,
+            )
+            v.phase_group = 1
+            v.color_fn_pre = lambda m, a: matrix_to_colors_sequential_per_row(m, a)
+            v.color_fn_post = lambda m, a: matrix_to_colors_sequential_per_row_fade(m, a)
+            stage.visuals.append(v)
+
+            # Group 2: argmax (select highest probability token)
+            v = ActivationVisual(
+                pre=row_probs, post=token_selected,
+                origin=logits_origin.copy(),
+                box_size=bs, gap=gap,
+            )
+            v.phase_group = 2
+            v.color_fn_pre = lambda m, a: matrix_to_colors_sequential_per_row_fade(m, a)
+            v.color_fn_post = lambda m, a: matrix_to_colors_sequential_fade(m, a)
+            stage.visuals.append(v)
+            self.stages['token_probs'] = stage
 
     def _build_residual_ln_stage(self, name, add_a, add_b, add_c, ln_post, w, bs, gap):
         """Build a Residual + LayerNorm stage (Add group 0 → LN group 1)."""
@@ -405,9 +569,65 @@ class Scene:
         stage.visuals.append(v)
         self.stages[name] = stage
 
+    def _build_logits_only_stages(self, r, c, bs, gap):
+        """Build only token_probs for fast generation steps (skip output_projection)."""
+        if 'logits' not in r:
+            return
+
+        vocab_size = r['logits'].shape[1]
+        w_vocab = vocab_size * SPACING
+
+        # Token Probabilities (softmax → row selection → argmax)
+        stage = Stage('token_probs')
+        z_tp = STAGE_Z['token_probs']
+        logits_origin = matrix_origin(z_tp, -w_vocab / 2, 2)
+
+        pred_pos = int(r.get('pred_pos', 0))
+        row_probs = np.zeros_like(r['probs'])
+        row_probs[pred_pos] = r['probs'][pred_pos]
+
+        token_selected = np.zeros_like(r['probs'])
+        best_j = int(np.argmax(r['probs'][pred_pos]))
+        token_selected[pred_pos, best_j] = 1.0
+
+        v = ActivationVisual(
+            pre=r['logits'], post=r['probs'],
+            origin=logits_origin.copy(), box_size=bs, gap=gap,
+        )
+        v.phase_group = 0
+        v.color_fn_post = lambda m, a: matrix_to_colors_sequential_per_row(m, a)
+        stage.visuals.append(v)
+
+        v = ActivationVisual(
+            pre=r['probs'], post=row_probs,
+            origin=logits_origin.copy(), box_size=bs, gap=gap,
+        )
+        v.phase_group = 1
+        v.color_fn_pre = lambda m, a: matrix_to_colors_sequential_per_row(m, a)
+        v.color_fn_post = lambda m, a: matrix_to_colors_sequential_per_row_fade(m, a)
+        stage.visuals.append(v)
+
+        v = ActivationVisual(
+            pre=row_probs, post=token_selected,
+            origin=logits_origin.copy(), box_size=bs, gap=gap,
+        )
+        v.phase_group = 2
+        v.color_fn_pre = lambda m, a: matrix_to_colors_sequential_per_row_fade(m, a)
+        v.color_fn_post = lambda m, a: matrix_to_colors_sequential_fade(m, a)
+        stage.visuals.append(v)
+        self.stages['token_probs'] = stage
+
+        # Wire: in-place transitions (no fly-in from output_projection)
+        tp = self.stages['token_probs'].visuals
+        tp[0].from_origin = tp[0].origin.copy()
+        tp[1].from_origin = tp[0].origin.copy()
+        tp[2].from_origin = tp[1].origin.copy()
+
     def _wire_flow_connections(self):
         """Wire up from_origin on each visual so data flies from the previous stage/sub-op."""
         s = self.stages
+        if 'input' not in s:
+            return
 
         # --- Input stage: fade in at position ---
         input_v = s['input'].visuals[0]
@@ -435,13 +655,13 @@ class Scene:
 
             # Sub-op 1 (Q_h × K_h^T): Q_h comes from head h's SLICE of Q
             q_slice_origin = qkv_Q.origin_c.copy()
-            q_slice_origin[0] += h * d_k * SPACING
+            q_slice_origin[0] -= h * d_k * SPACING
             mha[base].from_origin_a = q_slice_origin
 
             # K_h^T (B of sub-op 1): transpose changes shape (8×4 → 4×8),
             # animate the transpose by flying each element from [c,r] → [r,c]
             k_slice_origin = qkv_K.origin_c.copy()
-            k_slice_origin[0] += h * d_k * SPACING
+            k_slice_origin[0] -= h * d_k * SPACING
             mha[base].from_origin_b = k_slice_origin
             mha[base].transpose_fly_b = True
 
@@ -454,7 +674,7 @@ class Scene:
 
             # V_h (B of sub-op 3): flies from V output, head h's slice
             v_slice_origin = qkv_V.origin_c.copy()
-            v_slice_origin[0] += h * d_k * SPACING
+            v_slice_origin[0] -= h * d_k * SPACING
             mha[base + 2].from_origin_b = v_slice_origin
 
         # --- Concat × W_O: head outputs merge into concat via slice-aware fly-in ---
@@ -506,6 +726,30 @@ class Scene:
         output_v = s['output'].visuals[0]
         output_v.from_origin = res_ln2[1].origin.copy()
 
+        # --- Blocks 2-4: chain from previous block ---
+        prev_v = output_v
+        for blk_name in ['block_2', 'block_3', 'block_4']:
+            if blk_name not in s:
+                break
+            blk_v = s[blk_name].visuals[0]
+            blk_v.from_origin = prev_v.origin.copy()
+            prev_v.is_stage_output = True
+            prev_v = blk_v
+
+        # --- Output Projection: A from last block ---
+        if 'output_projection' in s:
+            out_proj_v = s['output_projection'].visuals[0]
+            out_proj_v.from_origin_a = prev_v.origin.copy()
+            prev_v.is_stage_output = True
+
+            # --- Token Probs: group 0 from output_projection C ---
+            tp = s['token_probs'].visuals
+            tp[0].from_origin = out_proj_v.origin_c.copy()
+            # group 1 from group 0's position (in-place)
+            tp[1].from_origin = tp[0].origin.copy()
+            # group 2 from group 1's position (in-place)
+            tp[2].from_origin = tp[1].origin.copy()
+
     def _get_visual_extents(self, v):
         """Return (origin, rows, cols, spacing, box_size) tuples for a visual."""
         if isinstance(v, MatmulVisual):
@@ -551,8 +795,8 @@ class Scene:
             if group is not None and getattr(v, 'phase_group', 0) != group:
                 continue
             for origin, rows, cols, sp, bs in self._get_visual_extents(v):
-                x0 = origin[0] - bs / 2
-                x1 = origin[0] + (cols - 1) * sp + bs / 2
+                x0 = origin[0] - (cols - 1) * sp - bs / 2
+                x1 = origin[0] + bs / 2
                 y0 = origin[1] - (rows - 1) * sp - bs / 2
                 y1 = origin[1] + bs / 2
                 z0 = origin[2] - bs / 2
@@ -624,17 +868,54 @@ class Scene:
             ortho_size = max(half_h, half_w / assumed_aspect)
             return position, target, ortho_size
 
+        def compute_char_display_framing():
+            """Direct framing from character positions, bypassing dummy visual."""
+            positions = np.array([d[1] for d in self._char_display_data],
+                                 dtype=np.float64)
+            center = positions.mean(axis=0)
+
+            char_vcx = float(np.dot(center, cam_right))
+            char_vcy = float(np.dot(center, cam_up))
+            char_fwd = float(np.dot(center, cam_fwd))
+            target = char_vcx * cam_right + char_vcy * cam_up + char_fwd * cam_fwd
+            position = target + cam_offset_dir * cam_dist
+
+            # View-space extent of character group
+            vx_vals = [float(np.dot(p, cam_right)) for p in positions]
+            half_vx = (max(vx_vals) - min(vx_vals)) / 2.0 + 4.0 if len(vx_vals) > 1 else 4.0
+            half_vy = 4.0  # enough for big characters
+            ortho_size = max(half_vy + margin, half_vx / assumed_aspect + margin)
+            return position, target, ortho_size
+
         for tl_stage in self.timeline.stages:
             sname = tl_stage.stage_name
             stage = self.stages[sname]
             num_groups = stage._get_num_groups()
 
+            # Skip zero-duration stages (e.g. 'input' when char_display handles it)
+            if tl_stage.total_duration <= 0:
+                continue
+
             if num_groups <= 1:
                 # Single group: one framing for the whole stage
-                pos, tgt, osz = compute_framing(sname)
-                t_arrive = tl_stage.start_time + tl_stage.appear_duration * 0.5
-                self.camera.add_waypoint(t_arrive, pos, tgt, osz)
-                self.camera.add_waypoint(tl_stage.end_time, pos, tgt, osz)
+                if sname == 'char_display' and self._char_display_data:
+                    pos, tgt, osz = compute_char_display_framing()
+                    t_arrive = tl_stage.start_time + tl_stage.appear_duration * 0.5
+                    self.camera.add_waypoint(t_arrive, pos, tgt, osz)
+                    # During compute, transition camera to input framing
+                    # so input matrix is visible as chars fly toward it
+                    if 'input' in self.stages:
+                        t_compute_start = tl_stage.start_time + tl_stage.appear_duration
+                        inp_pos, inp_tgt, inp_osz = compute_framing('input')
+                        self.camera.add_waypoint(t_compute_start + 0.3, pos, tgt, osz)
+                        self.camera.add_waypoint(tl_stage.end_time, inp_pos, inp_tgt, inp_osz)
+                    else:
+                        self.camera.add_waypoint(tl_stage.end_time, pos, tgt, osz)
+                else:
+                    pos, tgt, osz = compute_framing(sname)
+                    t_arrive = tl_stage.start_time + tl_stage.appear_duration * 0.5
+                    self.camera.add_waypoint(t_arrive, pos, tgt, osz)
+                    self.camera.add_waypoint(tl_stage.end_time, pos, tgt, osz)
             else:
                 # Multi-group: camera reframes per operation
                 t_compute = tl_stage.start_time + tl_stage.appear_duration
@@ -659,14 +940,17 @@ class Scene:
                 # Settle: hold last group's framing
                 self.camera.add_waypoint(tl_stage.end_time, pos, tgt, osz)
 
-        first_pos, first_tgt, first_osz = compute_framing(
-            self.timeline.stages[0].stage_name)
+        first_name = self.timeline.stages[0].stage_name
+        if first_name == 'char_display' and self._char_display_data:
+            first_pos, first_tgt, first_osz = compute_char_display_framing()
+        else:
+            first_pos, first_tgt, first_osz = compute_framing(first_name)
         loop_end = self.timeline.total_duration + self.timeline.return_duration
         self.camera.add_waypoint(loop_end, first_pos, first_tgt, first_osz)
 
     def _matrix_label_pos(self, origin, rows, cols, sp):
         """Position above the center-top of a matrix."""
-        x = origin[0] + (cols - 1) * sp / 2
+        x = origin[0] - (cols - 1) * sp / 2
         y = origin[1] + 1.2
         z = origin[2]
         return np.array([x, y, z], dtype=np.float32)
@@ -674,20 +958,39 @@ class Scene:
     def _build_labels(self):
         """Create labels for every matrix in every stage.
 
-        Each label is (text, world_pos, visual, phase) where phase is:
+        Each label is (text, world_pos, visual, phase, no_bg) where phase is:
           'appear'  – fades in with visual.appear_t  (inputs that fly in)
           'compute' – fades in with visual.t          (results that emerge)
+        no_bg=True disables the dark background quad behind the label.
         """
+        if self.final_display:
+            return
+        if self.logits_only:
+            self._build_logits_only_labels()
+            return
         c = self.config
 
         def lbl(stage_name, text, origin, rows, cols, sp, vis, phase='appear'):
             pos = self._matrix_label_pos(origin, rows, cols, sp)
-            self.stages[stage_name].labels.append((text, pos, vis, phase))
+            self.stages[stage_name].labels.append((text, pos, vis, phase, False))
 
         # --- Input ---
         v = self.stages['input'].visuals[0]
         r, cl = v.matrix.shape
         lbl('input', 'X', v.origin, r, cl, v.sp, v)
+
+        # Per-row character labels (to the right of the matrix on screen)
+        # Also compute end positions for char_display fly animation
+        if self.input_labels:
+            for row_idx, char_label in enumerate(self.input_labels):
+                pos = np.array([
+                    v.origin[0] - cl * v.sp - 0.8,
+                    v.origin[1] - row_idx * v.sp,
+                    v.origin[2]
+                ], dtype=np.float32)
+                self._char_end_positions[row_idx] = pos.copy()
+                self.stages['input'].labels.append(
+                    (char_label, pos, v, 'appear', True, 'left'))
 
         # --- QKV Projection: A flies in (appear), B+C emerge (compute) ---
         qkv_label_names = [('W_Q', 'Q'), ('W_K', 'K'), ('W_V', 'V')]
@@ -777,10 +1080,139 @@ class Scene:
         rl, cll = v_ln.post.shape
         lbl('residual_ln2', 'LayerNorm', v_ln.origin, rl, cll, v_ln.sp, v_ln, 'appear')
 
-        # --- Output ---
+        # --- Output (Block 1) ---
         v = self.stages['output'].visuals[0]
         r, cl = v.matrix.shape
-        lbl('output', 'Output', v.origin, r, cl, v.sp, v)
+        lbl('output', 'Block 1', v.origin, r, cl, v.sp, v)
+
+        # --- Blocks 2-4 ---
+        for blk_name, blk_label in [('block_2', 'Block 2'), ('block_3', 'Block 3'), ('block_4', 'Block 4')]:
+            if blk_name in self.stages:
+                v = self.stages[blk_name].visuals[0]
+                r, cl = v.post.shape
+                lbl(blk_name, blk_label, v.origin, r, cl, v.sp, v)
+
+        # --- Output Projection ---
+        if 'output_projection' in self.stages:
+            v = self.stages['output_projection'].visuals[0]
+            ra, ca = v.A.shape
+            lbl('output_projection', 'Output', v.origin_a, ra, ca, v.sp, v, 'appear')
+            rb, cb = v.B.shape
+            lbl('output_projection', 'Embed\u1d40', v.origin_b, rb, cb, v.sp_b, v, 'compute')
+            rc, cc = v.C.shape
+            lbl('output_projection', 'Logits', v.origin_c, rc, cc, v.sp_c, v, 'compute')
+
+        # --- Token Probabilities ---
+        if 'token_probs' in self.stages:
+            from transformer.vocab import ID_TO_CHAR
+            tp_visuals = self.stages['token_probs'].visuals
+            v0 = tp_visuals[0]  # group 0: softmax
+            v1 = tp_visuals[1]  # group 1: row selection
+            v2 = tp_visuals[2]  # group 2: argmax
+            r0, c0 = v0.pre.shape
+
+            # Main section labels — raised to make room for column headers
+            x_center = v0.origin[0] - (c0 - 1) * v0.sp / 2
+            main_y = v0.origin[1] + 2.2
+            softmax_pos = np.array([x_center, main_y, v0.origin[2]], dtype=np.float32)
+            self.stages['token_probs'].labels.append(
+                ('Softmax', softmax_pos, v0, 'appear', False))
+            argmax_pos = np.array([x_center, main_y, v2.origin[2]], dtype=np.float32)
+            self.stages['token_probs'].labels.append(
+                ('argmax', argmax_pos, v2, 'appear', False))
+
+            # Per-column token labels (a, b, ..., z, ., -)
+            col_y = v0.origin[1] + 0.8
+            for col_idx in range(c0):
+                tok = ID_TO_CHAR.get(col_idx, '?')
+                if tok == '<END>':
+                    tok = '.'
+                elif tok == '<PAD>':
+                    tok = '-'
+                col_pos = np.array([
+                    v0.origin[0] - col_idx * v0.sp,
+                    col_y,
+                    v0.origin[2]
+                ], dtype=np.float32)
+                self.stages['token_probs'].labels.append(
+                    (tok, col_pos, v0, 'appear', True))
+
+        # Per-row prediction labels (to the right of the matrix on screen)
+        # Attach to token_probs group 2 if it exists, otherwise to output
+        if self.output_labels:
+            if 'token_probs' in self.stages:
+                target_stage = 'token_probs'
+                target_v = self.stages['token_probs'].visuals[2]
+                target_origin = target_v.origin
+                target_sp = target_v.sp
+                target_cols = target_v.pre.shape[1]
+            else:
+                target_stage = 'output'
+                target_v = self.stages['output'].visuals[0]
+                target_origin = target_v.origin
+                target_sp = target_v.sp
+                target_cols = target_v.matrix.shape[1]
+            for row_idx, pred_label in enumerate(self.output_labels):
+                pos = np.array([
+                    target_origin[0] - target_cols * target_sp - 0.8,
+                    target_origin[1] - row_idx * target_sp,
+                    target_origin[2]
+                ], dtype=np.float32)
+                self.stages[target_stage].labels.append(
+                    (pred_label, pos, target_v, 'appear', False, 'left'))
+
+    def _build_logits_only_labels(self):
+        """Build labels for logits_only mode (token_probs only)."""
+        c = self.config
+
+        def lbl(stage_name, text, origin, rows, cols, sp, vis, phase='appear'):
+            pos = self._matrix_label_pos(origin, rows, cols, sp)
+            self.stages[stage_name].labels.append((text, pos, vis, phase, False))
+
+        # Token Probabilities
+        if 'token_probs' in self.stages:
+            from transformer.vocab import ID_TO_CHAR
+            tp_visuals = self.stages['token_probs'].visuals
+            v0 = tp_visuals[0]
+            v2 = tp_visuals[2]
+            r0, c0 = v0.pre.shape
+
+            x_center = v0.origin[0] - (c0 - 1) * v0.sp / 2
+            main_y = v0.origin[1] + 2.2
+            softmax_pos = np.array([x_center, main_y, v0.origin[2]], dtype=np.float32)
+            self.stages['token_probs'].labels.append(
+                ('Softmax', softmax_pos, v0, 'appear', False))
+            argmax_pos = np.array([x_center, main_y, v2.origin[2]], dtype=np.float32)
+            self.stages['token_probs'].labels.append(
+                ('argmax', argmax_pos, v2, 'appear', False))
+
+            col_y = v0.origin[1] + 0.8
+            for col_idx in range(c0):
+                tok = ID_TO_CHAR.get(col_idx, '?')
+                if tok == '<PAD>':
+                    tok = '-'
+                col_pos = np.array([
+                    v0.origin[0] - col_idx * v0.sp,
+                    col_y,
+                    v0.origin[2]
+                ], dtype=np.float32)
+                self.stages['token_probs'].labels.append(
+                    (tok, col_pos, v0, 'appear', True))
+
+        # Per-row prediction labels (to the right of the matrix on screen)
+        if self.output_labels and 'token_probs' in self.stages:
+            target_v = self.stages['token_probs'].visuals[2]
+            target_origin = target_v.origin
+            target_sp = target_v.sp
+            target_cols = target_v.pre.shape[1]
+            for row_idx, pred_label in enumerate(self.output_labels):
+                pos = np.array([
+                    target_origin[0] - target_cols * target_sp - 0.8,
+                    target_origin[1] - row_idx * target_sp,
+                    target_origin[2]
+                ], dtype=np.float32)
+                self.stages['token_probs'].labels.append(
+                    (pred_label, pos, target_v, 'appear', False, 'left'))
 
     def render_labels(self, text_renderer, fb_w, fb_h):
         """Render labels in world space using the camera's view/projection.
@@ -796,18 +1228,84 @@ class Scene:
         # Scale labels with camera zoom so they stay readable when zoomed out
         char_height = 0.75 * (self.camera.ortho_size / 10.0)
 
+        # Animated char_display labels (custom rendering with position/size animation)
+        self._render_char_display(text_renderer, view, proj, char_height)
+
         for stage_name, stage in self.stages.items():
             if stage.alpha < 0.01:
                 continue
-            for idx, (text, world_pos, visual, phase) in enumerate(stage.labels):
+            for idx, label in enumerate(stage.labels):
+                text, world_pos, visual, phase, no_bg = label[:5]
+                align = label[5] if len(label) > 5 else 'center'
                 label_alpha = self._label_fade.get((stage_name, idx), 0.0)
                 if label_alpha < 0.01:
                     continue
 
+                bg = (0, 0, 0, 0) if no_bg else (0.0, 0.0, 0.0, 0.92)
+                h = char_height
                 text_renderer.render_text_3d(
                     text, world_pos, view, proj,
-                    char_height=char_height,
-                    color=(1.0, 1.0, 1.0, label_alpha * 0.9))
+                    char_height=h,
+                    color=(1.0, 1.0, 1.0, label_alpha * 0.9),
+                    bg_color=bg,
+                    align=align)
+
+    def _render_char_display(self, text_renderer, view, proj, normal_char_height):
+        """Render animated character labels for char_display stage."""
+        if not self._char_display_data or 'char_display' not in self.stages:
+            return
+        stage = self.stages['char_display']
+        if stage.alpha < 0.01:
+            return
+        v = stage.visuals[0]
+
+        big_height = min(4.0 * (self.camera.ortho_size / 10.0),
+                         self._char_spacing * 1.4)
+
+        for char, start_pos, row_idx in self._char_display_data:
+            end_pos = self._char_end_positions.get(row_idx)
+
+            # Character metrics for alignment correction
+            info = text_renderer.char_info.get(char, text_renderer.char_info.get(' '))
+            advance_px = info[4] if info else 0
+
+            if v.t > 0.0 and end_pos is not None:
+                # Compute phase: fly from start to end, shrink
+                t = min(v.t, 1.0)
+                t_smooth = t * t * (3.0 - 2.0 * t)  # smoothstep
+                pos = start_pos * (1.0 - t_smooth) + end_pos * t_smooth
+                h = big_height * (1.0 - t_smooth) + normal_char_height * t_smooth
+                alpha = stage.alpha
+                # Y: transition from vertically centered (big) to bottom-aligned (small)
+                center_offset_y = h * 0.5 * (1.0 - t_smooth)
+                # X: transition from center-aligned (big) to left-aligned (matching input labels)
+                scale_h = h / max(text_renderer.cell_h, 1)
+                center_offset_x = advance_px * scale_h / 2 * (1.0 - t_smooth)
+                # Fade out at end for clean handoff to input row labels
+                if t > 0.9:
+                    alpha *= max(0.0, 1.0 - (t - 0.9) / 0.1)
+            else:
+                # Appear phase or final display (stay big at start)
+                pos = start_pos
+                h = big_height
+                alpha = stage.alpha * (1.0 if v.t > 0.0 else min(v.appear_t * 2.0, 1.0))
+                center_offset_y = h * 0.5
+                scale_h = h / max(text_renderer.cell_h, 1)
+                center_offset_x = advance_px * scale_h / 2
+
+            if alpha < 0.01:
+                continue
+            # Text renders upward from origin; offset down to center vertically
+            # X offset transitions from centering (big) to left-aligned (matching input labels)
+            render_pos = pos.copy()
+            render_pos[1] -= center_offset_y
+            render_pos[0] += center_offset_x
+            text_renderer.render_text_3d(
+                char, render_pos, view, proj,
+                char_height=h,
+                color=(1.0, 1.0, 1.0, alpha * 0.9),
+                bg_color=(0, 0, 0, 0),
+                align='left')
 
     def update(self, dt: float):
         self.timeline.update(dt)
@@ -827,7 +1325,8 @@ class Scene:
         FADE_OUT = 0.35
 
         for stage_name, stage in self.stages.items():
-            for idx, (text, world_pos, visual, phase) in enumerate(stage.labels):
+            for idx, label in enumerate(stage.labels):
+                text, world_pos, visual, phase, no_bg = label[:5]
                 key = (stage_name, idx)
 
                 # Target: should this label be visible?
@@ -841,6 +1340,23 @@ class Scene:
                     target *= getattr(visual, '_label_output_fade', 1.0)
 
                 target *= min(visual.alpha, 1.0)
+
+                # Suppress input row labels during char_display fly animation;
+                # crossfade: chars fade out → labels fade in at the end of compute
+                if stage_name == 'input' and self.has_char_display:
+                    align = label[5] if len(label) > 5 else 'center'
+                    if align == 'left':
+                        cd_phase, cd_t = self.timeline.get_stage_phase('char_display')
+                        if cd_phase == 'appear' or (cd_phase == 'compute' and cd_t < 0.9):
+                            target = 0.0
+                        elif cd_phase == 'compute':
+                            # Last 10% of compute: crossfade with char_display chars
+                            self._label_fade[key] = (cd_t - 0.9) / 0.1
+                            continue
+                        elif cd_phase == 'settle':
+                            # Chars are gone, labels fully visible
+                            self._label_fade[key] = 1.0
+                            continue
 
                 # Linear interpolation toward target
                 current = self._label_fade.get(key, 0.0)
@@ -865,6 +1381,17 @@ class Scene:
 
         for i, (stage_name, stage) in enumerate(self.stages.items()):
             phase, t = self.timeline.get_stage_phase(stage_name)
+
+            # When has_char_display, input has zero timeline duration;
+            # show it during char_display's compute phase instead
+            if stage_name == 'input' and self.has_char_display:
+                cd_phase, cd_t = self.timeline.get_stage_phase('char_display')
+                if cd_phase == 'compute':
+                    phase, t = 'appear', cd_t
+                elif cd_phase == 'settle':
+                    phase, t = 'settle', 1.0
+                # else: use timeline's phase ('done' etc.) for normal fade
+
             stage.update_animation(phase, t)
 
             # Reset per-frame visual state
@@ -911,18 +1438,18 @@ class Scene:
                                     v.alpha = 0.0
                                     v._label_output_fade = 0.0
 
-            # Fade done stages: previous stage fades during next stage's appear
+            # Fade done stages: previous stage fades during next active stage's appear
             if phase == 'done' and i < current_idx:
-                distance = current_idx - i
-                if distance == 1:
-                    next_name = stage_names[min(i + 1, len(stage_names) - 1)]
-                    next_phase, next_t = self.timeline.get_stage_phase(next_name)
-                    if next_phase == 'appear':
-                        fade = max(0.0, 1.0 - next_t)
-                    else:
-                        fade = 0.0
-                else:
-                    fade = 0.0
+                # Find next stage with nonzero duration (skip zero-duration stages)
+                fade = 0.0
+                for ni in range(i + 1, len(stage_names)):
+                    ns_name = stage_names[ni]
+                    ns_tl = self.timeline.get_stage(ns_name)
+                    if ns_tl and ns_tl.total_duration > 0:
+                        ns_phase, ns_t = self.timeline.get_stage_phase(ns_name)
+                        if ns_phase == 'appear':
+                            fade = max(0.0, 1.0 - ns_t * 4.0)
+                        break
                 stage.alpha = fade
                 for v in stage.visuals:
                     if v.is_stage_output:
@@ -931,7 +1458,8 @@ class Scene:
                     v.alpha = min(v.alpha, fade)
 
         # Return-to-start: fade all stages out
-        if self.timeline.current_time > self.timeline.total_duration:
+        if (self.timeline.current_time > self.timeline.total_duration
+                and self.timeline.return_duration > 0):
             return_t = ((self.timeline.current_time - self.timeline.total_duration)
                         / self.timeline.return_duration)
             fade = max(0.0, 1.0 - return_t * 2.0)
@@ -939,6 +1467,11 @@ class Scene:
                 stage.alpha *= fade
                 for v in stage.visuals:
                     v.alpha *= fade
+
+        # Hide char_display boxes (labels-only stage, rendered by _render_char_display)
+        if 'char_display' in self.stages:
+            for v in self.stages['char_display'].visuals:
+                v.output_alpha_mult = 0.0
 
     def render(self, aspect: float):
         view = self.camera.get_view_matrix()

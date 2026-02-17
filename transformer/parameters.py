@@ -4,10 +4,11 @@ from dataclasses import dataclass
 @dataclass
 class TransformerConfig:
     d_model: int = 16
-    seq_len: int = 8
+    seq_len: int = 16
     num_heads: int = 4
     d_k: int = 4        # d_model // num_heads
-    d_ff: int = 64       # Feed-forward hidden dimension
+    d_ff: int = 128      # Feed-forward hidden dimension
+    num_blocks: int = 4  # Number of transformer blocks
 
     def __post_init__(self):
         if self.d_model % self.num_heads != 0:

@@ -30,7 +30,7 @@ def _to_instance_array(instances):
 
 def _box_pos(origin, row, col, spacing):
     return np.array([
-        origin[0] + col * spacing,
+        origin[0] - col * spacing,
         origin[1] - row * spacing,
         origin[2]
     ], dtype=np.float32)
@@ -197,6 +197,14 @@ class MatmulVisual(BaseVisual):
         self.sp_b = (box_size_b or box_size) + (gap_b if gap_b is not None else gap)
         self.bs_c = box_size_c if box_size_c is not None else box_size
         self.sp_c = (box_size_c or box_size) + (gap_c if gap_c is not None else gap)
+
+        # Shift origins so col 0 is at highest X (screen-left with camera azimuth π/4)
+        _, ca = A.shape
+        self.origin_a[0] += (ca - 1) * self.sp
+        _, cb = B.shape
+        self.origin_b[0] += (cb - 1) * self.sp_b
+        _, cc = C.shape
+        self.origin_c[0] += (cc - 1) * self.sp_c
 
         # Flow connections (set by scene)
         self.from_origin_a = None  # Single origin for A fly-in
@@ -445,7 +453,7 @@ class MatmulVisual(BaseVisual):
                         for i in range(m):
                             collapse_t = _wave_t((sub_t - 0.65) / 0.35, i, 0, m, 1, 0.3)
                             row_center = np.array([
-                                self.origin_a[0] + (k - 1) * self.sp / 2,
+                                self.origin_a[0] - (k - 1) * self.sp / 2,
                                 self.origin_a[1] - i * self.sp,
                                 self.origin_a[2]
                             ], dtype=np.float32)
@@ -489,6 +497,12 @@ class AddVisual(BaseVisual):
         self.origin_c = np.array(origin_c, dtype=np.float32)
         self.bs = box_size
         self.sp = box_size + gap
+
+        # Shift origins so col 0 is at highest X (screen-left)
+        _, cols = A.shape
+        self.origin_a[0] += (cols - 1) * self.sp
+        self.origin_b[0] += (cols - 1) * self.sp
+        self.origin_c[0] += (cols - 1) * self.sp
 
         self.from_origin_a = None
         self.from_origin_b = None
@@ -612,16 +626,23 @@ class ActivationVisual(BaseVisual):
         self.bs = box_size
         self.sp = box_size + gap
 
+        # Shift origin so col 0 is at highest X (screen-left)
+        _, cols = pre.shape
+        self.origin[0] += (cols - 1) * self.sp
+
         self.from_origin = None
         self.to_origin = None
+
+        self.color_fn_pre = None   # optional: (matrix, alpha) -> colors
+        self.color_fn_post = None
 
         self._colors_pre = None
         self._colors_post = None
 
     def _ensure_colors(self):
         if self._colors_pre is None:
-            self._colors_pre = matrix_to_colors(self.pre, 1.0)
-            self._colors_post = matrix_to_colors(self.post, 1.0)
+            self._colors_pre = (self.color_fn_pre or matrix_to_colors)(self.pre, 1.0)
+            self._colors_post = (self.color_fn_post or matrix_to_colors)(self.post, 1.0)
 
     def get_instance_data(self):
         if self.alpha < 0.01 or self.output_alpha_mult < 0.01:
@@ -643,10 +664,10 @@ class ActivationVisual(BaseVisual):
                     pos = _bezier_pos(src, dst, at, row=r, col=c)
                     color = self._colors_pre[r, c].copy()
                     if seamless:
-                        color[3] = self.alpha
+                        color[3] *= self.alpha
                         instances.append(_make_instance(pos, color, self.bs))
                     else:
-                        color[3] = self.alpha * at
+                        color[3] *= self.alpha * at
                         instances.append(_make_instance(pos, color, self.bs * (0.3 + 0.7 * at)))
             return _to_instance_array(instances)
 
@@ -658,7 +679,7 @@ class ActivationVisual(BaseVisual):
                     elem_t = _wave_t(ct, r, c, rows, cols, 0.4)
                     pos = _box_pos(self.origin, r, c, self.sp)
                     color = self._colors_pre[r, c] * (1.0 - elem_t) + self._colors_post[r, c] * elem_t
-                    color[3] = self.alpha
+                    color[3] *= self.alpha
                     scale = self.bs
                     if 0.05 < elem_t < 0.95:
                         scale *= 1.0 + 0.2 * np.sin(elem_t * np.pi)
@@ -673,7 +694,7 @@ class ActivationVisual(BaseVisual):
                     dst = _box_pos(self.to_origin, r, c, self.sp)
                     pos = _bezier_pos(src, dst, dt_val, row=r, col=c)
                     color = self._colors_post[r, c].copy()
-                    color[3] = self.alpha
+                    color[3] *= self.alpha
                     instances.append(_make_instance(pos, color, self.bs))
 
         return _to_instance_array(instances)
@@ -688,6 +709,10 @@ class StaticMatrixVisual(BaseVisual):
         self.origin = np.array(origin, dtype=np.float32)
         self.bs = box_size
         self.sp = box_size + gap
+
+        # Shift origin so col 0 is at highest X (screen-left)
+        _, cols = matrix.shape
+        self.origin[0] += (cols - 1) * self.sp
 
         self.from_origin = None
         self.to_origin = None

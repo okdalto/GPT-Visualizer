@@ -3,7 +3,7 @@ from OpenGL import GL as gl
 
 
 class AppWindow:
-    def __init__(self, width=1600, height=900, title="Transformer Block Visualizer"):
+    def __init__(self, width=1600, height=900, title="GPT Visualizer"):
         if not glfw.init():
             raise RuntimeError("Failed to initialize GLFW")
 

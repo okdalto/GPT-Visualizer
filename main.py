@@ -23,7 +23,7 @@ from visualization.scene import Scene
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Transformer Block Visualizer")
+    parser = argparse.ArgumentParser(description="GPT Visualizer")
     parser.add_argument("--record", action="store_true",
                         help="Record animation as image sequence")
     parser.add_argument("--fps", type=int, default=30,
@@ -38,17 +38,25 @@ def parse_args():
                         help="Image format (default: jpg)")
     parser.add_argument("--output-dir", type=str, default=None,
                         help="Output directory (default: recordings/)")
+    parser.add_argument("--text", type=str, default=None,
+                        help="Input text prompt for autoregressive generation")
+    parser.add_argument("--weights", type=str, default=None,
+                        help="Path to trained weights (.npz)")
+    parser.add_argument("--temperature", type=float, default=0.3,
+                        help="Sampling temperature (0=greedy, >0=random, e.g. 0.8)")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Random seed for sampling (default: deterministic from input)")
     return parser.parse_args()
 
 
 def setup(args):
-    """Create window, shaders, scene. Returns (app, scene, box_shader, text_renderer, label_renderer)."""
+    """Create window, shaders, scene. Returns (app, scene, box_shader, text_renderer, label_renderer, config, generation_steps)."""
     if args.record:
         w, h = 640, 360  # small context window; actual rendering via offscreen FBO
         title = f"Recording {args.width}x{args.height} @ {args.fps}fps..."
     else:
         w, h = 1600, 900
-        title = "Transformer Block Visualizer"
+        title = "GPT Visualizer"
 
     app = AppWindow(width=w, height=h, title=title)
 
@@ -65,19 +73,99 @@ def setup(args):
     label_renderer = TextRenderer(
         os.path.join(base_dir, "shaders", "text.vert"),
         os.path.join(base_dir, "shaders", "text.frag"),
-        font_size=40,
+        font_size=96,
     )
 
     config = TransformerConfig()
-    transformer = TransformerBlock(config)
-    x = np.random.RandomState(123).randn(config.seq_len, config.d_model).astype(np.float32) * 0.5
-    results = transformer.forward(x)
+    input_labels = None
+    output_labels = None
+
+    weights_path = args.weights
+    if weights_path is None:
+        default_path = os.path.join(base_dir, "transformer", "weights", "charlm.npz")
+        if args.text and os.path.exists(default_path):
+            weights_path = default_path
+
+    generation_steps = None
+
+    if weights_path and os.path.exists(weights_path) and args.text:
+        from transformer.model import CharLM
+        from transformer.vocab import (
+            encode_text, make_labels, ID_TO_CHAR, CHAR_TO_ID, PAD_ID,
+        )
+
+        model = CharLM(config)
+        model.load(weights_path)
+
+        # Pre-compute all autoregressive generation steps
+        generation_steps = []
+        current_chars = [c for c in args.text.lower() if c in CHAR_TO_ID]
+        current_chars = current_chars[:config.seq_len]
+
+        print("=== Autoregressive Generation ===")
+        for step in range(config.seq_len):
+            token_ids = encode_text(
+                ''.join(current_chars), config.seq_len)
+            results = model.forward(token_ids, temperature=args.temperature,
+                                    seed=args.seed)
+            pred_pos = len(current_chars) - 1
+            pred_id = int(results['predicted_ids'][pred_pos])
+            pred_prob = float(results['probs'][pred_pos, pred_id]) * 100
+
+            in_labels = make_labels(token_ids)
+            out_labels = [''] * config.seq_len
+            pred_char = make_labels(np.array([pred_id]))[0]
+            out_labels[pred_pos] = f"{pred_char} {pred_prob:.0f}%"
+
+            results['pred_pos'] = pred_pos
+            generation_steps.append((results, in_labels, out_labels))
+            print(f"  Step {step + 1}: "
+                  f"{''.join(current_chars)} -> {pred_char} ({pred_prob:.0f}%)")
+
+            if pred_id == PAD_ID or len(current_chars) >= config.seq_len:
+                break
+            current_chars.append(ID_TO_CHAR[pred_id])
+
+        # Final step: show the completed text
+        final_text = ''.join(current_chars)
+        token_ids = encode_text(final_text, config.seq_len)
+        results = model.forward(token_ids, temperature=args.temperature,
+                                seed=args.seed)
+        in_labels = make_labels(token_ids)
+        out_labels = [''] * config.seq_len
+        results['pred_pos'] = len(current_chars) - 1
+        generation_steps.append((results, in_labels, out_labels))
+
+        print(f"  Result: {repr(final_text)}")
+        print()
+
+        # Use first step for initial scene
+        results, input_labels, output_labels = generation_steps[0]
+    else:
+        blocks = [TransformerBlock(config, seed=42 + i) for i in range(config.num_blocks)]
+        x = np.random.RandomState(123).randn(config.seq_len, config.d_model).astype(np.float32) * 0.5
+        block_results = []
+        inp = x
+        for block in blocks:
+            r = block.forward(inp, causal=True)
+            block_results.append(r)
+            inp = r['output']
+        results = dict(block_results[0])
+        for i, r in enumerate(block_results):
+            results[f'block_{i}'] = r
+        results['output'] = block_results[-1]['output']
+
     if args.record:
         aspect = args.width / max(args.height, 1)
     else:
         fb_w, fb_h = app.get_framebuffer_size()
         aspect = fb_w / max(fb_h, 1)
-    scene = Scene(results, config, box_shader, aspect=aspect)
+    scene = Scene(results, config, box_shader, aspect=aspect,
+                  input_labels=input_labels, output_labels=output_labels)
+
+    # For generation mode: first step plays once, last step loops
+    if generation_steps and len(generation_steps) > 1:
+        scene.timeline.loop = False
 
     gl.glEnable(gl.GL_DEPTH_TEST)
     gl.glEnable(gl.GL_BLEND)
@@ -85,7 +173,7 @@ def setup(args):
     gl.glEnable(gl.GL_MULTISAMPLE)
     gl.glClearColor(0.0, 0.0, 0.0, 1.0)
 
-    return app, scene, box_shader, text_renderer, label_renderer
+    return app, scene, box_shader, text_renderer, label_renderer, config, generation_steps
 
 
 def render_frame(scene, text_renderer, label_renderer, fb_w, fb_h):
@@ -182,7 +270,30 @@ def destroy_fbo(fbo):
 
 
 def run_interactive(args):
-    app, scene, box_shader, text_renderer, label_renderer = setup(args)
+    app, scene, box_shader, text_renderer, label_renderer, config, gen_steps = setup(args)
+
+    # Mutable references for closures
+    scene_ref = [scene]
+    step_idx = [0]
+
+    def advance_generation():
+        """Advance to next generation step if available."""
+        if not gen_steps or step_idx[0] >= len(gen_steps) - 1:
+            return
+        step_idx[0] += 1
+        results, in_lbl, out_lbl = gen_steps[step_idx[0]]
+        fb_w, fb_h = app.get_framebuffer_size()
+        aspect = fb_w / max(fb_h, 1)
+        is_last = step_idx[0] == len(gen_steps) - 1
+        new_scene = Scene(results, config, box_shader, aspect=aspect,
+                          input_labels=in_lbl, output_labels=out_lbl,
+                          renderer=scene_ref[0].renderer,
+                          final_display=is_last,
+                          logits_only=(not is_last))
+        new_scene.timeline.loop = False
+        scene_ref[0] = new_scene
+        print(f"  Generation step {step_idx[0] + 1}/{len(gen_steps)}")
+        sys.stdout.flush()
 
     def on_key(key, scancode, action, mods):
         if action != glfw.PRESS:
@@ -190,32 +301,32 @@ def run_interactive(args):
         if key == glfw.KEY_ESCAPE:
             glfw.set_window_should_close(app.window, True)
         elif key == glfw.KEY_SPACE:
-            scene.timeline.toggle_play()
+            scene_ref[0].timeline.toggle_play()
         elif key == glfw.KEY_RIGHT:
-            idx = scene.timeline.get_current_stage_index()
-            scene.timeline.jump_to_stage(idx + 1)
+            idx = scene_ref[0].timeline.get_current_stage_index()
+            scene_ref[0].timeline.jump_to_stage(idx + 1)
         elif key == glfw.KEY_LEFT:
-            idx = scene.timeline.get_current_stage_index()
-            scene.timeline.jump_to_stage(idx - 1)
+            idx = scene_ref[0].timeline.get_current_stage_index()
+            scene_ref[0].timeline.jump_to_stage(idx - 1)
         elif key == glfw.KEY_EQUAL or key == glfw.KEY_KP_ADD:
-            scene.timeline.speed = min(5.0, scene.timeline.speed + 0.25)
-            print(f"Speed: {scene.timeline.speed:.2f}x")
+            scene_ref[0].timeline.speed = min(5.0, scene_ref[0].timeline.speed + 0.25)
+            print(f"Speed: {scene_ref[0].timeline.speed:.2f}x")
         elif key == glfw.KEY_MINUS or key == glfw.KEY_KP_SUBTRACT:
-            scene.timeline.speed = max(0.25, scene.timeline.speed - 0.25)
-            print(f"Speed: {scene.timeline.speed:.2f}x")
+            scene_ref[0].timeline.speed = max(0.25, scene_ref[0].timeline.speed - 0.25)
+            print(f"Speed: {scene_ref[0].timeline.speed:.2f}x")
         elif key == glfw.KEY_R:
-            scene.timeline.current_time = 0.0
-            scene.timeline.playing = True
+            scene_ref[0].timeline.current_time = 0.0
+            scene_ref[0].timeline.playing = True
             print("Reset to beginning")
 
     app.add_key_callback(on_key)
-    app.add_mouse_callback(lambda dx, dy: scene.camera.handle_mouse(dx, dy))
-    app.add_scroll_callback(lambda xo, yo: scene.camera.handle_scroll(xo, yo))
+    app.add_mouse_callback(lambda dx, dy: scene_ref[0].camera.handle_mouse(dx, dy))
+    app.add_scroll_callback(lambda xo, yo: scene_ref[0].camera.handle_scroll(xo, yo))
 
     last_time = glfw.get_time()
     last_stage = ""
 
-    print("=== Transformer Block Visualizer ===")
+    print("=== GPT Visualizer ===")
     print("Controls:")
     print("  Space      : Play / Pause")
     print("  Left/Right : Previous / Next stage")
@@ -224,6 +335,8 @@ def run_interactive(args):
     print("  Mouse drag : Orbit camera")
     print("  Scroll     : Zoom")
     print("  Esc        : Quit")
+    if gen_steps:
+        print(f"\n  Generation mode: {len(gen_steps)} steps")
     print()
     sys.stdout.flush()
 
@@ -232,21 +345,25 @@ def run_interactive(args):
         dt = min(current_time - last_time, 0.05)
         last_time = current_time
 
-        scene.update(dt)
+        scene_ref[0].update(dt)
+
+        # Advance generation when current cycle completes
+        if gen_steps and scene_ref[0].timeline.completed:
+            advance_generation()
 
         fb_w, fb_h = app.get_framebuffer_size()
-        stage = render_frame(scene, text_renderer, label_renderer, fb_w, fb_h)
+        stage = render_frame(scene_ref[0], text_renderer, label_renderer, fb_w, fb_h)
 
-        phase, phase_t = stage.get_phase(scene.timeline.current_time)
+        phase, phase_t = stage.get_phase(scene_ref[0].timeline.current_time)
         stage_id = f"{stage.stage_name}:{phase}"
         if stage_id != last_stage:
             last_stage = stage_id
-            print(f"  [{stage.stage_name}] {phase} (t={scene.timeline.current_time:.1f}s)")
+            print(f"  [{stage.stage_name}] {phase} (t={scene_ref[0].timeline.current_time:.1f}s)")
             sys.stdout.flush()
 
         app.swap_and_poll()
 
-    scene.renderer.destroy()
+    scene_ref[0].renderer.destroy()
     box_shader.destroy()
     text_renderer.destroy()
     label_renderer.destroy()
@@ -254,7 +371,7 @@ def run_interactive(args):
 
 
 def run_record(args):
-    app, scene, box_shader, text_renderer, label_renderer = setup(args)
+    app, scene, box_shader, text_renderer, label_renderer, config, gen_steps = setup(args)
     fbo = create_offscreen_fbo(args.width, args.height)
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -263,65 +380,108 @@ def run_record(args):
 
     ext = args.format
     save_kwargs = {"quality": 95} if ext == "jpg" else {}
-
-    scene.timeline.playing = False
-    loop_duration = scene.timeline.total_duration + scene.timeline.return_duration
-    sim_dt = args.speed / args.fps
-    total_frames = int(loop_duration * args.fps / args.speed)
     fb_w, fb_h = fbo['w'], fbo['h']
+    sim_dt = args.speed / args.fps
+    aspect = args.width / max(args.height, 1)
+    renderer = scene.renderer
 
+    # Build list of scenes for each generation step
+    scenes = []
+    if gen_steps and len(gen_steps) > 1:
+        for si, (results, in_lbl, out_lbl) in enumerate(gen_steps):
+            is_last = si == len(gen_steps) - 1
+            is_first = si == 0
+            s = Scene(results, config, box_shader, aspect=aspect,
+                      input_labels=in_lbl, output_labels=out_lbl,
+                      renderer=renderer,
+                      final_display=is_last,
+                      logits_only=(not is_last and not is_first))
+            s.timeline.playing = False
+            s.timeline.loop = False
+            scenes.append(s)
+    else:
+        scene.timeline.playing = False
+        scenes.append(scene)
+
+    # Calculate per-step frame counts
+    step_infos = []
+    total_frames = 0
+    for s in scenes:
+        dur = s.timeline.total_duration + s.timeline.return_duration
+        nf = int(dur * args.fps / args.speed)
+        step_infos.append((s, dur, nf))
+        total_frames += nf
+
+    total_duration = sum(dur for _, dur, _ in step_infos)
     print(f"=== Recording: {total_frames} frames @ {args.fps}fps (speed={args.speed}x) ===")
-    print(f"  Duration : {loop_duration:.1f}s (animation {scene.timeline.total_duration:.1f}s + return {scene.timeline.return_duration:.1f}s)")
+    print(f"  Steps    : {len(scenes)}")
+    print(f"  Duration : {total_duration:.1f}s total")
+    for si, (s, dur, nf) in enumerate(step_infos):
+        mode = "full" if si == 0 else ("final" if si == len(scenes) - 1 else "logits")
+        print(f"    Step {si+1}: {dur:.1f}s ({nf} frames, {mode})")
     print(f"  Output   : {out_dir}/frame_XXXXX.{ext}")
     print(f"  Size     : {fb_w}x{fb_h} (offscreen FBO)")
     print()
 
-    # Warm up: advance scene to t=0 so camera/visuals initialize
-    scene.timeline.current_time = 0.0
-    scene.update(1.0 / 60.0)
+    # Record all frames across all steps
+    num_saved = 0
+    frame_idx = 0
+    aborted = False
+    for step_i, (s, dur, nf) in enumerate(step_infos):
+        print(f"--- Step {step_i+1}/{len(scenes)} ({nf} frames) ---")
+        sys.stdout.flush()
 
-    for i in range(total_frames):
-        scene.timeline.current_time = (i * sim_dt) % loop_duration
-        scene.update(0.0)
+        # Warm up
+        s.timeline.current_time = 0.0
+        s.update(1.0 / 60.0)
 
-        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, fbo['msaa'])
-        gl.glViewport(0, 0, fb_w, fb_h)
-        stage = render_frame(scene, text_renderer, label_renderer, fb_w, fb_h)
-        img = fbo_read_pixels(fbo)
+        for i in range(nf):
+            s.timeline.current_time = i * sim_dt
+            s.update(0.0)
 
-        frame_path = os.path.join(out_dir, f"frame_{i:05d}.{ext}")
-        img.save(frame_path, **save_kwargs)
+            gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, fbo['msaa'])
+            gl.glViewport(0, 0, fb_w, fb_h)
+            stage = render_frame(s, text_renderer, label_renderer, fb_w, fb_h)
+            img = fbo_read_pixels(fbo)
 
-        app.swap_and_poll()
-        if app.should_close():
-            print("\nWindow closed, stopping.")
+            frame_path = os.path.join(out_dir, f"frame_{frame_idx:05d}.{ext}")
+            img.save(frame_path, **save_kwargs)
+            frame_idx += 1
+            num_saved += 1
+
+            app.swap_and_poll()
+            if app.should_close():
+                print("\nWindow closed, stopping.")
+                aborted = True
+                break
+
+            if (i + 1) % args.fps == 0 or i == nf - 1:
+                pct = frame_idx / total_frames * 100
+                print(f"  [{frame_idx}/{total_frames}] {pct:.0f}%  t={s.timeline.current_time:.1f}s  {stage.stage_name}")
+                sys.stdout.flush()
+
+        if aborted:
             break
 
-        if (i + 1) % args.fps == 0 or i == total_frames - 1:
-            pct = (i + 1) / total_frames * 100
-            print(f"  [{i+1}/{total_frames}] {pct:.0f}%  t={scene.timeline.current_time:.1f}s  {stage.stage_name}")
-            sys.stdout.flush()
-
-    num_saved = i + 1
     print(f"\nDone. {num_saved} frames saved to {out_dir}/")
 
-    # Get transformer results for sound generation
-    config = TransformerConfig()
-    transformer = TransformerBlock(config)
-    x = np.random.RandomState(123).randn(config.seq_len, config.d_model).astype(np.float32) * 0.5
-    results = transformer.forward(x)
-
     destroy_fbo(fbo)
-    scene.renderer.destroy()
+    renderer.destroy()
     box_shader.destroy()
     text_renderer.destroy()
     label_renderer.destroy()
     app.terminate()
 
-    # Generate audio
+    # Generate audio for each step and concatenate
     print("\n=== Generating soundtrack ===")
     from audio import build_soundtrack, write_wav
-    audio = build_soundtrack(results, config)
+    audio_parts = []
+    for si, (s, dur, nf) in enumerate(step_infos):
+        print(f"  Step {si+1}/{len(scenes)}:")
+        part = build_soundtrack(s.results, config, timeline=s.timeline,
+                               logits_only=s.logits_only)
+        audio_parts.append(part)
+    audio = np.concatenate(audio_parts, axis=0)
     wav_path = os.path.join(out_dir, "soundtrack.wav")
     write_wav(wav_path, audio)
     print(f"  Audio saved to {wav_path}")

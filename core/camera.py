@@ -87,7 +87,13 @@ class Camera:
         # Find segment and interpolate with smoothstep (no overshoot)
         for i in range(len(self.waypoints) - 1):
             if self.waypoints[i].time <= t <= self.waypoints[i + 1].time:
-                seg_t = (t - self.waypoints[i].time) / (self.waypoints[i + 1].time - self.waypoints[i].time)
+                dt_seg = self.waypoints[i + 1].time - self.waypoints[i].time
+                if dt_seg < 1e-9:
+                    self.position = self.waypoints[i + 1].position.astype(np.float32).copy()
+                    self.target = self.waypoints[i + 1].target.astype(np.float32).copy()
+                    self.ortho_size = self.waypoints[i + 1].ortho_size
+                    break
+                seg_t = (t - self.waypoints[i].time) / dt_seg
                 s = smoothstep(0.0, 1.0, seg_t)
 
                 p0 = self.waypoints[i].position

@@ -14,19 +14,23 @@ def layer_norm(x, gamma, beta, eps=1e-5):
 
 
 class TransformerBlock:
-    def __init__(self, config: TransformerConfig):
+    def __init__(self, config: TransformerConfig, seed: int = 42):
         self.config = config
-        rng = np.random.RandomState(42)
+        rng = np.random.RandomState(seed)
 
         d = config.d_model
-        self.W_Q = rng.randn(d, d).astype(np.float32) * 0.15
-        self.W_K = rng.randn(d, d).astype(np.float32) * 0.15
-        self.W_V = rng.randn(d, d).astype(np.float32) * 0.15
-        self.W_O = rng.randn(d, d).astype(np.float32) * 0.15
+        # Xavier initialization: scale = sqrt(2 / (fan_in + fan_out))
+        attn_scale = np.sqrt(2.0 / (d + d))
+        self.W_Q = rng.randn(d, d).astype(np.float32) * attn_scale
+        self.W_K = rng.randn(d, d).astype(np.float32) * attn_scale
+        self.W_V = rng.randn(d, d).astype(np.float32) * attn_scale
+        self.W_O = rng.randn(d, d).astype(np.float32) * attn_scale
 
-        self.W1 = rng.randn(d, config.d_ff).astype(np.float32) * 0.1
+        ffn_scale1 = np.sqrt(2.0 / (d + config.d_ff))
+        ffn_scale2 = np.sqrt(2.0 / (config.d_ff + d))
+        self.W1 = rng.randn(d, config.d_ff).astype(np.float32) * ffn_scale1
         self.b1 = np.zeros(config.d_ff, dtype=np.float32)
-        self.W2 = rng.randn(config.d_ff, d).astype(np.float32) * 0.1
+        self.W2 = rng.randn(config.d_ff, d).astype(np.float32) * ffn_scale2
         self.b2 = np.zeros(d, dtype=np.float32)
 
         self.gamma1 = np.ones(d, dtype=np.float32)
@@ -34,7 +38,7 @@ class TransformerBlock:
         self.gamma2 = np.ones(d, dtype=np.float32)
         self.beta2 = np.zeros(d, dtype=np.float32)
 
-    def forward(self, x: np.ndarray) -> dict:
+    def forward(self, x: np.ndarray, causal: bool = False) -> dict:
         results = {}
         results['input'] = x.copy()
 
@@ -67,6 +71,11 @@ class TransformerBlock:
             v_h = V_heads[:, h, :]
 
             score = q_h @ k_h.T / np.sqrt(float(dk))
+            if causal:
+                causal_mask = np.triu(
+                    np.ones((self.config.seq_len, self.config.seq_len),
+                            dtype=np.float32), k=1)
+                score = score - causal_mask * 1e9
             weight = softmax(score, axis=-1)
             out = weight @ v_h
 
@@ -77,6 +86,10 @@ class TransformerBlock:
         results['attention_scores'] = attention_scores
         results['attention_weights'] = attention_weights
         results['head_outputs'] = head_outputs
+        if causal:
+            results['causal_mask'] = np.triu(
+                np.ones((self.config.seq_len, self.config.seq_len),
+                        dtype=np.float32), k=1)
 
         # Concatenate heads
         concat = np.concatenate(head_outputs, axis=-1)

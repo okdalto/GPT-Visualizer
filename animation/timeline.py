@@ -47,7 +47,8 @@ class StageTimeline:
 #          Higher = faster (2.0 → half duration), 0.5 → double.
 #          Omit or use empty list for stages with no compute.
 STAGE_SPEED = {
-    'input':              {'appear': 1.0, 'settle': 2.0},
+    'char_display':       {'appear': 4.0, 'settle': 4.0, 'compute': [2.5]},
+    'input':              {'appear': 1.0, 'settle': 0.5},
     'qkv_projection':     {'appear': 1.0, 'settle': 1.0, 'compute': [
                                0.6,           # QKV matmul (parallel)
                            ]},
@@ -68,11 +69,16 @@ STAGE_SPEED = {
                                1.0,           # ReLU
                                0.25,           # × W2
                            ]},
-    'residual_ln2':       {'appear': 1.0, 'settle': 1.0, 'compute': [
+    'residual_ln2':       {'appear': 1.0, 'settle': 1.3, 'compute': [
                                1.0,           # Add
                                1.0,           # LayerNorm
                            ]},
-    'output':             {'appear': 1.0, 'settle': 1.0},
+    'output':             {'appear': 2.0, 'settle': 2.0},
+    'block_2':            {'appear': 1.5, 'settle': 1.5, 'compute': [1.5]},
+    'block_3':            {'appear': 1.5, 'settle': 1.5, 'compute': [1.5]},
+    'block_4':            {'appear': 1.5, 'settle': 1.5, 'compute': [1.5]},
+    'output_projection':  {'appear': 1.0, 'settle': 1.0, 'compute': [0.4]},
+    'token_probs':        {'appear': 1.0, 'settle': 2.0, 'compute': [1.0, 2.0, 2.0]},
 }
 
 
@@ -97,17 +103,26 @@ def _compute_group_segments(group_speeds: list[float]) -> tuple[float, list[tupl
 
 
 class AnimationTimeline:
-    def __init__(self):
+    def __init__(self, has_lm_head: bool = False, has_char_display: bool = False,
+                 final_display: bool = False, logits_only: bool = False):
         self.stages: list[StageTimeline] = []
         self.total_duration: float = 0.0
-        self.return_duration: float = 3.0
+        self.return_duration: float = 1.3
         self.current_time: float = 0.0
         self.playing: bool = True
         self.speed: float = 1.0
+        self.loop: bool = True
+        self.completed: bool = False
 
-        self._build_default_timeline()
+        self._build_default_timeline(has_lm_head, has_char_display,
+                                     final_display, logits_only)
+        if logits_only:
+            self.speed = 3.0
 
-    def _build_default_timeline(self):
+    def _build_default_timeline(self, has_lm_head: bool = False,
+                                has_char_display: bool = False,
+                                final_display: bool = False,
+                                logits_only: bool = False):
         t = 0.0
 
         # Uniform base timing
@@ -116,20 +131,46 @@ class AnimationTimeline:
         SETTLE = 1.0
 
         # (stage_name, num_phase_groups)
-        configs = [
-            ('input',              0),
-            ('qkv_projection',     1),
-            ('multi_head_attn',    3),
-            ('concat_output_proj', 1),
-            ('residual_ln1',       2),
-            ('ffn',                3),
-            ('residual_ln2',       2),
-            ('output',             0),
-        ]
+        if final_display:
+            configs = [('char_display', 1)]
+        elif logits_only:
+            configs = []
+            if has_char_display:
+                configs.append(('char_display', 1))
+            configs.extend([
+                ('token_probs',       3),
+            ])
+        else:
+            configs = []
+            if has_char_display:
+                configs.append(('char_display', 1))
+            configs.extend([
+                ('input',              0),
+                ('qkv_projection',     1),
+                ('multi_head_attn',    3),
+                ('concat_output_proj', 1),
+                ('residual_ln1',       2),
+                ('ffn',                3),
+                ('residual_ln2',       2),
+                ('output',             0),
+                ('block_2',            1),
+                ('block_3',            1),
+                ('block_4',            1),
+            ])
+            if has_lm_head:
+                configs.extend([
+                    ('output_projection', 1),
+                    ('token_probs',       3),
+                ])
         for name, groups in configs:
             cfg = STAGE_SPEED.get(name, {})
             appear = APPEAR / cfg.get('appear', 1.0)
             settle = SETTLE / cfg.get('settle', 1.0)
+
+            # Input matrix appears during char_display compute; skip its own timing
+            if name == 'input' and has_char_display:
+                appear = 0.0
+                settle = 0.0
 
             # Per-group compute speeds
             group_speeds = cfg.get('compute', [1.0] * groups)
@@ -151,7 +192,12 @@ class AnimationTimeline:
             self.current_time += dt * self.speed
             loop_duration = self.total_duration + self.return_duration
             if self.current_time > loop_duration:
-                self.current_time %= loop_duration
+                if self.loop:
+                    self.current_time %= loop_duration
+                else:
+                    self.current_time = loop_duration
+                    self.completed = True
+                    self.playing = False
 
     def get_stage(self, name: str) -> StageTimeline:
         for s in self.stages:
