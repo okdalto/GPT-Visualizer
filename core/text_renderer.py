@@ -16,6 +16,7 @@ STAGE_DISPLAY_NAMES = {
     'ffn':                'Feed-Forward Network',
     'residual_ln2':       'Residual + LayerNorm 2',
     'output':             'Block 1 Output',
+    'block_1':            'Block 1',
     'block_2':            'Block 2',
     'block_3':            'Block 3',
     'block_4':            'Block 4',

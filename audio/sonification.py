@@ -564,6 +564,17 @@ def build_soundtrack(results, config, timeline=None, logits_only=False):
         elif name == 'output':
             all_events += events_appear(results['output'], t_appear, appear_dur)
 
+        # ── Block 1: abbreviated input → block_0 output ──
+        elif name == 'block_1':
+            if 'block_0' in results and 'output' in results['block_0']:
+                all_events += events_appear(
+                    results['input'], t_appear, appear_dur)
+                if compute_dur > 0:
+                    all_events += events_softmax(
+                        results['input'],
+                        results['block_0']['output'],
+                        t_compute, compute_dur)
+
         # ── Blocks 2-4: simplified transition ──
         elif name in ('block_2', 'block_3', 'block_4'):
             # stage block_N shows transition: block_{N-2} output → block_{N-1} output
@@ -579,15 +590,19 @@ def build_soundtrack(results, config, timeline=None, logits_only=False):
                         results[post_key]['output'],
                         t_compute, compute_dur)
 
-        # ── Output Projection: matmul ──
+        # ── Output Projection: matmul (full) or static logits (logits_only) ──
         elif name == 'output_projection':
-            if 'W_out' in results and 'logits' in results:
-                all_events += events_appear(
-                    results['output'], t_appear, appear_dur)
-                if compute_dur > 0:
-                    all_events += events_matmul(
-                        results['output'], results['W_out'],
-                        results['logits'], t_compute, compute_dur)
+            if 'logits' in results:
+                if logits_only:
+                    all_events += events_appear(
+                        results['logits'], t_appear, appear_dur)
+                elif 'W_out' in results:
+                    all_events += events_appear(
+                        results['output'], t_appear, appear_dur)
+                    if compute_dur > 0:
+                        all_events += events_matmul(
+                            results['output'], results['W_out'],
+                            results['logits'], t_compute, compute_dur)
 
         # ── Token Probabilities: softmax + selection ──
         elif name == 'token_probs':

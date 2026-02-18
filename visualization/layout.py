@@ -32,6 +32,7 @@ STAGE_Z = {
     'ffn': 76.0,            # = residual_ln1 + RESIDUAL_ADD_Z (seamless from LN1)
     'residual_ln2': 100.0,
     'output': 106.0,         # = residual_ln2 + RESIDUAL_ADD_Z (seamless from LN2)
+    'block_1': 106.0,       # alias for output Z (used in logits_only abbreviated mode)
     'block_2': 114.0,
     'block_3': 122.0,
     'block_4': 130.0,

@@ -74,11 +74,21 @@ STAGE_SPEED = {
                                1.0,           # LayerNorm
                            ]},
     'output':             {'appear': 2.0, 'settle': 2.0},
+    'block_1':            {'appear': 1.5, 'settle': 1.5, 'compute': [1.5]},
     'block_2':            {'appear': 1.5, 'settle': 1.5, 'compute': [1.5]},
     'block_3':            {'appear': 1.5, 'settle': 1.5, 'compute': [1.5]},
     'block_4':            {'appear': 1.5, 'settle': 1.5, 'compute': [1.5]},
     'output_projection':  {'appear': 1.0, 'settle': 1.0, 'compute': [0.4]},
     'token_probs':        {'appear': 1.0, 'settle': 2.0, 'compute': [1.0, 2.0, 2.0]},
+}
+
+# Speed overrides for logits_only abbreviated mode (arrow-key skip feel)
+LOGITS_ONLY_SPEED = {
+    'block_1':            {'appear': 6.0, 'settle': 3.0},
+    'block_2':            {'appear': 6.0, 'settle': 3.0},
+    'block_3':            {'appear': 6.0, 'settle': 3.0},
+    'block_4':            {'appear': 6.0, 'settle': 3.0},
+    'output_projection':  {'appear': 6.0, 'settle': 3.0},
 }
 
 
@@ -138,6 +148,12 @@ class AnimationTimeline:
             if has_char_display:
                 configs.append(('char_display', 1))
             configs.extend([
+                ('input',             0),   # 0 duration (chars fly during char_display)
+                ('block_1',           0),   # static flash (no compute animation)
+                ('block_2',           0),
+                ('block_3',           0),
+                ('block_4',           0),
+                ('output_projection', 0),   # logits matrix flash
                 ('token_probs',       3),
             ])
         else:
@@ -163,7 +179,10 @@ class AnimationTimeline:
                     ('token_probs',       3),
                 ])
         for name, groups in configs:
-            cfg = STAGE_SPEED.get(name, {})
+            if logits_only and name in LOGITS_ONLY_SPEED:
+                cfg = LOGITS_ONLY_SPEED[name]
+            else:
+                cfg = STAGE_SPEED.get(name, {})
             appear = APPEAR / cfg.get('appear', 1.0)
             settle = SETTLE / cfg.get('settle', 1.0)
 
