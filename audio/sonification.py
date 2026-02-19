@@ -607,9 +607,8 @@ def build_soundtrack(results, config, timeline=None, logits_only=False):
         # ── Token Probabilities: softmax + selection ──
         elif name == 'token_probs':
             if 'logits' in results and 'probs' in results:
-                if not logits_only:
-                    all_events += events_appear(
-                        results['logits'], t_appear, appear_dur)
+                all_events += events_appear(
+                    results['logits'], t_appear, appear_dur)
                 for gi, (seg_s, seg_e) in enumerate(stage.group_segments):
                     seg_dur = (seg_e - seg_s) * compute_dur
                     seg_t = t_compute + seg_s * compute_dur
@@ -658,10 +657,12 @@ def build_soundtrack(results, config, timeline=None, logits_only=False):
     # Compress dynamics so loud/quiet sections are more even
     mono = _compress(mono)
 
-    # Normalize
+    # Normalize — logits_only steps are shorter with fewer events,
+    # so use a lower target to match the perceived volume of the full pipeline.
+    target_peak = 0.30 if logits_only else 0.85
     peak = np.max(np.abs(mono))
     if peak > 0:
-        mono = mono / peak * 0.85
+        mono = mono / peak * target_peak
 
     # Stereo: slight delay + pan variation based on time
     left = mono.copy()

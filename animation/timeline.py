@@ -47,7 +47,7 @@ class StageTimeline:
 #          Higher = faster (2.0 → half duration), 0.5 → double.
 #          Omit or use empty list for stages with no compute.
 STAGE_SPEED = {
-    'char_display':       {'appear': 4.0, 'settle': 4.0, 'compute': [2.5]},
+    'char_display':       {'appear': 2.0, 'settle': 1.5, 'compute': [2.5]},
     'input':              {'appear': 1.0, 'settle': 0.5},
     'qkv_projection':     {'appear': 1.0, 'settle': 1.0, 'compute': [
                                0.6,           # QKV matmul (parallel)
@@ -89,6 +89,7 @@ LOGITS_ONLY_SPEED = {
     'block_3':            {'appear': 6.0, 'settle': 3.0},
     'block_4':            {'appear': 6.0, 'settle': 3.0},
     'output_projection':  {'appear': 6.0, 'settle': 3.0},
+    'token_probs':        {'appear': 6.0},
 }
 
 

@@ -170,7 +170,8 @@ class Scene:
                  output_labels: list[str] = None,
                  renderer=None,
                  final_display: bool = False,
-                 logits_only: bool = False):
+                 logits_only: bool = False,
+                 prev_char_spacing: float = None):
         self.results = results
         self.config = config
         self.input_labels = input_labels
@@ -178,6 +179,7 @@ class Scene:
         self.aspect = aspect
         self.final_display = final_display
         self.logits_only = logits_only
+        self._prev_char_spacing = prev_char_spacing
         self.has_lm_head = 'logits' in results
         active = [l for l in (input_labels or []) if l not in ('_', '<END>')]
         self.has_char_display = len(active) > 0
@@ -229,7 +231,11 @@ class Scene:
             n_active = len(active_chars)
             z_cd = STAGE_Z['char_display']
             # Wider spacing for few chars, tighter for many (prevents overlap)
-            char_spacing = max(2.0, 4.5 - n_active * 0.15)
+            # Use previous scene's spacing if provided (seamless transition)
+            if self._prev_char_spacing is not None:
+                char_spacing = self._prev_char_spacing
+            else:
+                char_spacing = max(2.0, 4.5 - n_active * 0.15)
             self._char_spacing = char_spacing
 
             # Dummy visual (boxes hidden; only used so the stage has a visual)
@@ -713,10 +719,9 @@ class Scene:
         # Output projection flies from last block
         self.stages['output_projection'].visuals[0].from_origin = prev_v.origin.copy()
 
-        # Token probs: flies from output_projection, then in-place transitions
+        # Token probs: group 0 flies from output_projection, then in-place transitions
         tp = self.stages['token_probs'].visuals
         tp[0].from_origin = v_out.origin.copy()
-        tp[0].from_origin = tp[0].origin.copy()
         tp[1].from_origin = tp[0].origin.copy()
         tp[2].from_origin = tp[1].origin.copy()
 
@@ -1427,16 +1432,18 @@ class Scene:
 
         # Scale labels with camera zoom so they stay readable when zoomed out
         char_height = 0.75 * (self.camera.ortho_size / 10.0)
+        # Smaller height for input row chars (right of matrix & char_display landing)
+        input_char_height = 0.55 * (self.camera.ortho_size / 10.0)
 
         # Animated char_display labels (custom rendering with position/size animation)
-        self._render_char_display(text_renderer, view, proj, char_height)
+        self._render_char_display(text_renderer, view, proj, input_char_height)
 
         # In logits_only mode, keep input characters visible so predicted char
         # can "land" among them
-        self._render_persistent_input_chars(text_renderer, view, proj, char_height)
+        self._render_persistent_input_chars(text_renderer, view, proj, input_char_height)
 
         # Predicted character flying back to input during return phase
-        self._render_predicted_char_return(text_renderer, view, proj, char_height)
+        self._render_predicted_char_return(text_renderer, view, proj, input_char_height)
 
         for stage_name, stage in self.stages.items():
             if stage.alpha < 0.01:
@@ -1449,7 +1456,8 @@ class Scene:
                     continue
 
                 bg = (0, 0, 0, 0) if no_bg else (0.0, 0.0, 0.0, 0.92)
-                h = char_height
+                # Input row char labels use smaller height
+                h = input_char_height if (stage_name == 'input' and align == 'left') else char_height
                 text_renderer.render_text_3d(
                     text, world_pos, view, proj,
                     char_height=h,
@@ -1495,8 +1503,8 @@ class Scene:
                 # Appear phase or final display (stay big at start)
                 pos = start_pos
                 h = big_height
-                if self.logits_only or v.t > 0.0:
-                    alpha = stage.alpha  # logits_only: chars already visible
+                if self.logits_only or self.final_display or v.t > 0.0:
+                    alpha = stage.alpha  # chars already visible from prev scene
                 else:
                     alpha = stage.alpha * min(v.appear_t * 2.0, 1.0)
                 center_offset_y = h * 0.5
@@ -1764,6 +1772,13 @@ class Scene:
                                     # Keep alpha > 0 so label persists;
                                     # visual boxes hidden via output_alpha_mult=0
                                     v._label_output_fade = 1.0
+                                elif isinstance(v, StaticMatrixVisual):
+                                    # StaticMatrixVisual has no separate A/B/C —
+                                    # output_alpha_mult=0 hides it completely.
+                                    # Hide via alpha instead (immediately).
+                                    v.output_alpha_mult = 1.0
+                                    v.alpha = 0.0
+                                    v._label_output_fade = 0.0
                                 elif phase == 'compute':
                                     next_start, next_end = stage._get_group_segment(g + 1)
                                     next_seg_len = next_end - next_start
@@ -1796,8 +1811,14 @@ class Scene:
                 for v in stage.visuals:
                     if v.is_stage_output:
                         v.output_alpha_mult = 0.0
-                    # min() preserves alpha=0 from in-place takeover
-                    v.alpha = min(v.alpha, fade)
+                    if isinstance(v, StaticMatrixVisual):
+                        # StaticMatrixVisual has no A/B/C split — hide
+                        # immediately so it doesn't overlap with the
+                        # next stage's visual flying from the same spot.
+                        v.alpha = 0.0
+                    else:
+                        # min() preserves alpha=0 from in-place takeover
+                        v.alpha = min(v.alpha, fade)
 
         # Return-to-start: fade all stages out
         if (self.timeline.current_time > self.timeline.total_duration
@@ -1806,11 +1827,11 @@ class Scene:
                         / self.timeline.return_duration)
             fade = max(0.0, 1.0 - return_t * 2.0)
             for sname, stage in self.stages.items():
-                # When predicted char flies, token_probs vanishes instantly
-                # so the output label "e 85%" doesn't duplicate the flying char
+                # When predicted char flies, token_probs fades quickly
+                # so the output label doesn't duplicate the flying char
                 if (self._predicted_char_return is not None
                         and sname == 'token_probs'):
-                    sf = 0.0
+                    sf = max(0.0, 1.0 - return_t * 5.0)
                 else:
                     sf = fade
                 stage.alpha *= sf

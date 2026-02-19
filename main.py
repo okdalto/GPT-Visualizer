@@ -285,11 +285,17 @@ def run_interactive(args):
         fb_w, fb_h = app.get_framebuffer_size()
         aspect = fb_w / max(fb_h, 1)
         is_last = step_idx[0] == len(gen_steps) - 1
+        # Pass previous return animation's spacing for seamless transition
+        prev_spacing = None
+        pcr = scene_ref[0]._predicted_char_return
+        if pcr is not None:
+            prev_spacing = pcr.char_spacing
         new_scene = Scene(results, config, box_shader, aspect=aspect,
                           input_labels=in_lbl, output_labels=out_lbl,
                           renderer=scene_ref[0].renderer,
                           final_display=is_last,
-                          logits_only=(not is_last))
+                          logits_only=(not is_last),
+                          prev_char_spacing=prev_spacing)
         new_scene.timeline.loop = False
         scene_ref[0] = new_scene
         print(f"  Generation step {step_idx[0] + 1}/{len(gen_steps)}")
@@ -391,11 +397,15 @@ def run_record(args):
         for si, (results, in_lbl, out_lbl) in enumerate(gen_steps):
             is_last = si == len(gen_steps) - 1
             is_first = si == 0
+            prev_spacing = None
+            if si > 0 and scenes[si - 1]._predicted_char_return is not None:
+                prev_spacing = scenes[si - 1]._predicted_char_return.char_spacing
             s = Scene(results, config, box_shader, aspect=aspect,
                       input_labels=in_lbl, output_labels=out_lbl,
                       renderer=renderer,
                       final_display=is_last,
-                      logits_only=(not is_last and not is_first))
+                      logits_only=(not is_last and not is_first),
+                      prev_char_spacing=prev_spacing)
             s.timeline.playing = False
             s.timeline.loop = False
             scenes.append(s)
