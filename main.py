@@ -120,12 +120,12 @@ def setup(args):
             out_labels[pred_pos] = f"{pred_char} {pred_prob:.0f}%"
 
             results['pred_pos'] = pred_pos
-            generation_steps.append((results, in_labels, out_labels))
             print(f"  Step {step + 1}: "
                   f"{''.join(current_chars)} -> {pred_char} ({pred_prob:.0f}%)")
 
             if pred_id == PAD_ID or len(current_chars) >= config.seq_len:
                 break
+            generation_steps.append((results, in_labels, out_labels))
             current_chars.append(ID_TO_CHAR[pred_id])
 
         # Final step: show the completed text
